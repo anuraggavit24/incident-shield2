@@ -17,9 +17,12 @@ import sys
 import time
 from collections import Counter, defaultdict
 from collections.abc import Iterator
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from urllib.parse import urlparse
+
+import httpx
 
 from .config import LOG_DIR, WEBHOOK_ID_FILE, ConfigError, Settings, load_settings
 from .logs import append_jsonl, iso, parse_paypal_time, read_jsonl, utcnow
@@ -419,6 +422,34 @@ def cmd_evidence_probe(settings: Settings, args: argparse.Namespace) -> None:
     print(f"\nStatuses: {results}. Now run dispute-show to check whether the evidence appears once or twice.")
 
 
+AUTH_STATUSES = frozenset({401, 403})
+
+
+class ProbeErrorPolicy:
+    """Decides when the lag probe gives up.
+
+    Auth errors (401/403) can mean a newly enabled reporting permission hasn't
+    activated yet, so they're tolerated for `auth_grace_hours` from probe start.
+    Any other error (or a network failure) counts toward `max_errors` in a row.
+    A successful query resets the count.
+    """
+
+    def __init__(self, max_errors: int, auth_grace_hours: float) -> None:
+        self.max_errors = max_errors
+        self.auth_grace_hours = auth_grace_hours
+        self.consecutive_errors = 0
+
+    def record_success(self) -> None:
+        self.consecutive_errors = 0
+
+    def record_error(self, status: int | None, hours_since_start: float) -> bool:
+        """Return True if the probe should abort."""
+        if status in AUTH_STATUSES and hours_since_start < self.auth_grace_hours:
+            return False
+        self.consecutive_errors += 1
+        return self.consecutive_errors >= self.max_errors
+
+
 def _txsearch_targets() -> dict[str, str]:
     """Map transaction/capture IDs we created -> created_at."""
     targets: dict[str, str] = {}
@@ -434,8 +465,9 @@ def _txsearch_targets() -> dict[str, str]:
 def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
     client = client_for(settings, "merchant")
     seen = {r["transaction_id"] for r in read_jsonl("txsearch") if r.get("event") == "first_seen"}
-    deadline = time.monotonic() + args.hours * 3600
-    consecutive_errors = 0
+    started = time.monotonic()
+    deadline = started + args.hours * 3600
+    policy = ProbeErrorPolicy(args.max_errors, args.auth_grace_hours)
     print(f"Polling Transaction Search every {args.interval}s for up to {args.hours}h. Ctrl+C to stop.")
     print(
         "Reported lag is an UPPER BOUND: measured from when this script recorded the payment, "
@@ -446,24 +478,33 @@ def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
         start = end - timedelta(hours=args.lookback_hours)
         targets = _txsearch_targets()
         found: dict[str, Any] = {}
-        page, total_pages, query_failed = 1, 1, False
+        page, total_pages = 1, 1
+        failed_status: int | None = None
+        query_failed = False
         while page <= total_pages:
-            response = client.request(
-                "GET",
-                "/v1/reporting/transactions",
-                params={
-                    "start_date": start.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "end_date": end.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                    "fields": "all",
-                    "page_size": 500,
-                    "page": page,
-                },
-            )
+            try:
+                response = client.request(
+                    "GET",
+                    "/v1/reporting/transactions",
+                    params={
+                        "start_date": start.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "end_date": end.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "fields": "all",
+                        "page_size": 500,
+                        "page": page,
+                    },
+                )
+            except (httpx.HTTPError, RuntimeError) as exc:
+                append_jsonl("txsearch", {"event": "query_error", "status": None, "error": repr(exc)})
+                print(f"  query failed: {exc!r}")
+                query_failed = True
+                break
             body = safe_json(response)
             if response.status_code != 200 or not isinstance(body, dict):
                 append_jsonl("txsearch", {"event": "query_error", "status": response.status_code, "body": body})
-                print(f"  query error HTTP {response.status_code} (see spike_logs/txsearch.jsonl)")
-                query_failed = True
+                hint = " (auth: tolerated during grace period)" if response.status_code in AUTH_STATUSES else ""
+                print(f"  query error HTTP {response.status_code}{hint} (see spike_logs/txsearch.jsonl)")
+                failed_status, query_failed = response.status_code, True
                 break
             total_pages = int(body.get("total_pages") or 1)
             for detail in body.get("transaction_details", []) or []:
@@ -473,16 +514,16 @@ def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
             page += 1
 
         if query_failed:
-            consecutive_errors += 1
-            if consecutive_errors >= args.max_errors:
-                finding("txsearch_aborted", consecutive_errors=consecutive_errors)
+            hours_running = (time.monotonic() - started) / 3600
+            if policy.record_error(failed_status, hours_running):
+                finding("txsearch_aborted", consecutive_errors=policy.consecutive_errors, last_status=failed_status)
                 print(
-                    f"ABORTING: {consecutive_errors} consecutive query errors. Check the app has "
+                    f"ABORTING: {policy.consecutive_errors} consecutive query errors. Check the app has "
                     "Transaction search enabled and the token has a reporting scope (run: token)."
                 )
                 return
         else:
-            consecutive_errors = 0
+            policy.record_success()
 
         now = utcnow()
         for tx_id, created_at in targets.items():
@@ -516,20 +557,69 @@ def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
         time.sleep(args.interval)
 
 
+def summarize(values: list[float]) -> str:
+    """median / p95 / max. p95 needs at least 2 samples."""
+    ordered = sorted(values)
+    p95 = statistics.quantiles(ordered, n=20, method="inclusive")[-1] if len(ordered) >= 2 else ordered[0]
+    return f"n={len(ordered)} median={statistics.median(ordered):.1f} p95={p95:.1f} max={ordered[-1]:.1f}"
+
+
+def first_deliveries(hooks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Earliest delivery per event ID. Redeliveries (e.g. after forced 503s) would inflate delay stats."""
+    earliest: dict[Any, dict[str, Any]] = {}
+    for hook in hooks:
+        key = hook.get("event_id")
+        if key not in earliest or hook.get("received_at", "") < earliest[key].get("received_at", ""):
+            earliest[key] = hook
+    return list(earliest.values())
+
+
 def verified_hooks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Only signature-verified deliveries may feed the spike's answers."""
     return [r for r in records if r.get("verified") is True and r.get("event_type")]
 
 
+DB_LAST_USED_FILE = LOG_DIR / "db_last_used.txt"
+
+
+def neon_endpoint_kind(url: str) -> str:
+    """Neon's pooled endpoints have '-pooler' in the host. They behave differently from direct ones."""
+    host = urlparse(url).hostname or ""
+    return "pooled" if "-pooler" in host else "direct"
+
+
+def idle_gate(last_used: datetime | None, now: datetime, min_idle_minutes: float) -> str | None:
+    """Return a refusal message if this script touched the DB too recently, else None."""
+    if last_used is None:
+        return None
+    idle_minutes = (now - last_used).total_seconds() / 60
+    if idle_minutes < min_idle_minutes:
+        return (
+            f"This script last used the database {idle_minutes:.1f} min ago; wait until "
+            f"{min_idle_minutes:.0f} min have passed (or pass --min-idle-minutes 0 to measure a warm start)."
+        )
+    return None
+
+
 def cmd_db_coldstart(settings: Settings | None, args: argparse.Namespace) -> None:
-    """Time connect + SELECT 1 against Postgres (run once after the DB has been idle)."""
+    """Time connect + SELECT 1 against Postgres after the DB has been idle."""
     try:
         import psycopg
     except ImportError as exc:
         raise ConfigError("pip install -r requirements-spike.txt (needs psycopg)") from exc
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
-        raise ConfigError("Set DATABASE_URL in .env (Neon connection string)")
+        raise ConfigError("Set DATABASE_URL in .env: the exact Neon connection string the app will use")
+    last_used = None
+    if DB_LAST_USED_FILE.exists():
+        last_used = datetime.fromisoformat(DB_LAST_USED_FILE.read_text(encoding="utf-8").strip())
+    refusal = idle_gate(last_used, utcnow(), args.min_idle_minutes)
+    if refusal:
+        raise ConfigError(refusal)
+    if last_used is None:
+        print("Note: no previous run recorded, so idle time is unknown (only this script's own use is tracked).")
+    kind = neon_endpoint_kind(url)
+    print(f"Endpoint: {kind}. Measured from THIS machine, not from Render.")
     for attempt in range(1, args.repeat + 1):
         started = time.perf_counter()
         with psycopg.connect(url, connect_timeout=30) as conn:
@@ -539,7 +629,17 @@ def cmd_db_coldstart(settings: Settings | None, args: argparse.Namespace) -> Non
         connect_ms = round((connected - started) * 1000)
         total_ms = round((done - started) * 1000)
         print(f"attempt {attempt}: connect={connect_ms} ms, connect+query={total_ms} ms")
-        finding("db_coldstart", attempt=attempt, connect_ms=connect_ms, total_ms=total_ms, idle_note=args.idle_note)
+        finding(
+            "db_coldstart",
+            attempt=attempt,
+            connect_ms=connect_ms,
+            total_ms=total_ms,
+            endpoint=kind,
+            idle_minutes=round((utcnow() - last_used).total_seconds() / 60, 1) if last_used and attempt == 1 else None,
+            measured_from="local machine",
+        )
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    DB_LAST_USED_FILE.write_text(iso(utcnow()), encoding="utf-8")
 
 
 def cmd_report(settings: Settings | None, args: argparse.Namespace) -> None:
@@ -561,18 +661,17 @@ def cmd_report(settings: Settings | None, args: argparse.Namespace) -> None:
     )
     for name, count in Counter(h["event_type"] for h in hooks).most_common():
         out(f"  {count:3d}  {name}")
-    handler_ms = [r["handler_ms"] for r in records if isinstance(r.get("handler_ms"), (int, float))]
+    handler_ms = [h["handler_ms"] for h in hooks if isinstance(h.get("handler_ms"), (int, float))]
     if handler_ms:
-        out(
-            f"  total handler ms (time until PayPal gets an answer): median={statistics.median(handler_ms):.0f} "
-            f"max={max(handler_ms):.0f}"
-        )
-    delays = [h["delivery_delay_s"] for h in hooks if isinstance(h.get("delivery_delay_s"), (int, float))]
+        out(f"  total handler ms, verified only (time until PayPal gets an answer): {summarize(handler_ms)}")
+    delays = [
+        h["delivery_delay_s"] for h in first_deliveries(hooks) if isinstance(h.get("delivery_delay_s"), (int, float))
+    ]
     if delays:
-        out(f"  delivery delay s: median={statistics.median(delays):.1f} max={max(delays):.1f}")
-    verify_ms = [h["verification"].get("elapsed_ms") for h in hooks if h["verification"].get("elapsed_ms")]
+        out(f"  delivery delay s, first deliveries only: {summarize(delays)}")
+    verify_ms = [h["verification"]["elapsed_ms"] for h in hooks if h["verification"].get("elapsed_ms")]
     if verify_ms:
-        out(f"  verify call ms:   median={statistics.median(verify_ms):.0f} max={max(verify_ms):.0f}")
+        out(f"  verify call ms: {summarize(verify_ms)}")
     retries = {k: v for k, v in Counter(h.get("event_id") for h in hooks).items() if v > 1}
     if retries:
         out("  redelivered events:")
@@ -696,12 +795,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interval", type=int, default=600, help="seconds between polls")
     p.add_argument("--hours", type=float, default=6.0)
     p.add_argument("--lookback-hours", type=float, default=48.0)
-    p.add_argument("--max-errors", type=int, default=3, help="abort after this many consecutive query errors")
+    p.add_argument("--max-errors", type=int, default=3, help="abort after this many consecutive non-auth errors")
+    p.add_argument(
+        "--auth-grace-hours", type=float, default=4.0, help="tolerate 401/403 this long (permission activation)"
+    )
     p.set_defaults(func=cmd_txsearch_probe)
 
     p = sub.add_parser("db-coldstart", help="Time Postgres connect + query (run after the DB has idled)")
     p.add_argument("--repeat", type=int, default=2, help="1st attempt = cold, later ones = warm")
-    p.add_argument("--idle-note", default="", help="e.g. 'idle 10 min'")
+    p.add_argument("--min-idle-minutes", type=float, default=10.0, help="refuse if this script used the DB sooner")
     p.set_defaults(func=cmd_db_coldstart)
 
     sub.add_parser("report", help="Summarise everything logged so far").set_defaults(func=cmd_report)

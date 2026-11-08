@@ -56,7 +56,7 @@ nano .env
 Fill in the merchant app, sender app, and card values. Then:
 
 ```bash
-pytest -q                                   # 27 tests must pass
+pytest -q                                   # 57 tests must pass
 ruff check .                                # must be clean
 python -m spike.run_spike token --app merchant
 python -m spike.run_spike token --app sender
@@ -125,21 +125,33 @@ Disputes may take a few minutes to appear. If they never do, that is a finding t
 **Retry behavior (about 15 minutes):** stop the receiver, start it again with `SPIKE_FORCE_503=1` (PowerShell: `$env:SPIKE_FORCE_503="1"`), make one card payment, then restart normally. The report lists the times each event was redelivered.
 This only measures the **first few retries**. Don't claim the full retry window as measured: take it from PayPal's webhook documentation and cite it.
 
-**Neon cold start (do this when convenient, any time today):** create a free Neon project, put its connection string in `DATABASE_URL`, leave it idle for at least 10 minutes, then:
+**Neon cold start (partial answer, any time today):** create a free Neon project and put in `DATABASE_URL` the **exact connection string the app will use**. Neon's pooled endpoint (host contains `-pooler`) and direct endpoint behave differently, and the script prints which one you're measuring. Then:
 ```bash
-python -m spike.run_spike db-coldstart --repeat 3 --idle-note "idle 10+ min"
+python -m spike.run_spike db-coldstart --repeat 3
 ```
-Attempt 1 is the cold start, later attempts are warm. Compare attempt 1 with the total handler time in the report. Also note Neon's current free-tier terms (compute hours, auto-suspend delay, project or data expiry) from their pricing page.
+- The script refuses to run if it touched the database less than 10 minutes ago. It can only track its own use, so don't open the database anywhere else in between.
+- Attempt 1 is the cold start, later attempts are warm.
+- This measures from **your machine, not from Render**. It's an indication only.
+- Also note Neon's current free-tier terms (compute hours, auto-suspend delay, any project or data expiry) from their pricing page.
 
 **Anytime:**
 ```bash
 python -m spike.run_spike report
 ```
-The report's answers use **signature-verified events only**. Your tunnel URL is public, so unverified requests are logged as metadata (size, hash, claimed type) and never counted.
+The report's answers use **signature-verified events only**. Handler time and delays are shown as median / p95 / max, and delays count first deliveries only, so redeliveries from the retry test don't inflate them. Your tunnel URL is public, so unverified requests are logged as metadata (size, hash, claimed type) and never counted.
 
-**Transaction Search lag values are upper bounds:** measured from when the script recorded the payment, at the probe's polling interval. The probe stops by itself after 3 consecutive query errors (for example a missing reporting permission), so check on it after the first poll.
+**Transaction Search lag values are upper bounds:** measured from when the script recorded the payment, at the probe's polling interval. Don't restart the probe unless you have to: time it isn't running only adds to the upper bound.
+The probe keeps going through 401/403 errors for the first 4 hours (`--auth-grace-hours`), because a newly enabled reporting permission may take a while to activate (unverified). Any other error 3 times in a row stops it, so check on it after the first poll.
 
 **Don't use the dashboard's webhook simulator.** Simulated events may not pass signature verification, which would pollute the results.
+
+---
+
+## Deferred to deploy day (Tuesday), not part of this spike
+
+- **Render free-tier spin-down cold start**, measured end to end: time from a webhook hitting a sleeping service until it answers. This is the bigger risk against PayPal's webhook timeout.
+- Neon cold start measured **from Render**, with the app's exact connection string.
+- Total handler time on Render for a verified event with a cold database.
 
 ---
 

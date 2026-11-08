@@ -44,6 +44,16 @@ client = PayPalClient(settings, settings.merchant, timeout=VERIFY_TIMEOUT_S)
 app = FastAPI(title="Incident Shield - sandbox spike receiver")
 
 
+MAX_LOGGED_STRING = 100
+
+
+def clip(value: Any) -> Any:
+    """Truncate attacker-controllable strings before they reach the log."""
+    if isinstance(value, str) and len(value) > MAX_LOGGED_STRING:
+        return value[:MAX_LOGGED_STRING] + "...[truncated]"
+    return value
+
+
 class BodyTooLarge(Exception):
     pass
 
@@ -116,8 +126,8 @@ async def paypal_webhook(request: Request) -> JSONResponse:
     headers = {k.lower(): v for k, v in request.headers.items()}
     base: dict[str, Any] = {
         "received_at": iso(received_at),
-        "transmission_id": headers.get("paypal-transmission-id"),
-        "transmission_time": headers.get("paypal-transmission-time"),
+        "transmission_id": clip(headers.get("paypal-transmission-id")),
+        "transmission_time": clip(headers.get("paypal-transmission-time")),
     }
 
     def done(outcome: str, http_status: int, record: dict[str, Any], *, verified: bool) -> JSONResponse:
@@ -137,7 +147,7 @@ async def paypal_webhook(request: Request) -> JSONResponse:
     try:
         raw = await read_capped(request, MAX_BODY_BYTES)
     except BodyTooLarge:
-        return done("rejected_too_large", 413, {"declared_bytes": declared or None}, verified=False)
+        return done("rejected_too_large", 413, {"declared_bytes": clip(declared) or None}, verified=False)
 
     meta = {"size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
     try:
@@ -147,7 +157,7 @@ async def paypal_webhook(request: Request) -> JSONResponse:
     except (ValueError, UnicodeDecodeError):
         return done("rejected_bad_json", 400, meta, verified=False)
 
-    claimed = {"claimed_event_id": event.get("id"), "claimed_event_type": event.get("event_type")}
+    claimed = {"claimed_event_id": clip(event.get("id")), "claimed_event_type": clip(event.get("event_type"))}
     verification = await run_in_threadpool(verify, headers, raw)
     status = verification["status"]
     is_verified = status == "SUCCESS"

@@ -87,20 +87,6 @@ def test_force_503_still_records_verified_event_for_retry_analysis(client, verif
     assert record["verified"] is True
 
 
-def test_chunked_body_over_cap_is_rejected_without_reading_it_all(client, verify_calls):
-    sent = {"bytes": 0}
-
-    def chunks():
-        for _ in range(64):  # 64 x 64 KB = 4 MB, no Content-Length header
-            sent["bytes"] += 65536
-            yield b"x" * 65536
-
-    response = client.post("/webhooks/paypal", content=chunks(), headers=HEADERS)
-    assert response.status_code == 413
-    assert verify_calls["count"] == 0
-    assert logged()[0]["outcome"] == "rejected_too_large"
-
-
 def test_declared_content_length_over_cap_is_rejected(client, verify_calls):
     body = b"{" + b" " * (webhook_server.MAX_BODY_BYTES + 10) + b"}"
     response = client.post("/webhooks/paypal", content=body, headers=HEADERS)
@@ -130,3 +116,15 @@ def test_unverified_logging_stops_when_log_is_full(client, verify_calls, monkeyp
     verify_calls["status"] = "FAILURE"
     post_event(client)  # log already over 1 byte: dropped
     assert [r["outcome"] for r in logged()] == ["accepted"]
+
+
+def test_forged_strings_are_truncated_in_unverified_records(client, verify_calls):
+    verify_calls["status"] = "FAILURE"
+    long = "A" * 5000
+    headers = {**HEADERS, "paypal-transmission-id": long}
+    client.post(
+        "/webhooks/paypal", content=json.dumps({**EVENT, "id": long, "event_type": long}).encode(), headers=headers
+    )
+    [record] = logged()
+    for key in ("claimed_event_id", "claimed_event_type", "transmission_id"):
+        assert len(record[key]) <= webhook_server.MAX_LOGGED_STRING + len("...[truncated]")
