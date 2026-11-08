@@ -56,7 +56,7 @@ nano .env
 Fill in the merchant app, sender app, and card values. Then:
 
 ```bash
-pytest -q                                   # 57 tests must pass
+pytest -q                                   # 74 tests must pass
 ruff check .                                # must be clean
 python -m spike.run_spike token --app merchant
 python -m spike.run_spike token --app sender
@@ -145,11 +145,22 @@ The probe keeps going through 401/403 errors for the first 4 hours (`--auth-grac
 
 **Don't use the dashboard's webhook simulator.** Simulated events may not pass signature verification, which would pollute the results.
 
----
+**PayPal's delivery timeout (optional, about 30 minutes, mostly waiting):** PayPal's docs give the retry rule (any non-2xx response is retried up to 25 times over 3 days) but not how long PayPal waits for an answer. To find out, restart the receiver with `SPIKE_ACK_DELAY_S=30`, make one card payment, and wait. If PayPal redelivers an event we answered 200 after 30 s, its timeout is under 30 s. Try 10 s next if so. The report's "redelivered events" section shows it.
 
-## Deferred to deploy day (Tuesday), not part of this spike
+### Render cold start: do this today (about 15 minutes of your time, plus idle waiting)
 
-- **Render free-tier spin-down cold start**, measured end to end: time from a webhook hitting a sleeping service until it answers. This is the bigger risk against PayPal's webhook timeout.
+The ack-before-processing design and the 503 retry assumptions depend on this number.
+
+1. render.com → New → Web Service → connect your GitHub repo (push first).
+2. Runtime: Python. Build command: `pip install -r requirements-spike.txt`. Start command: `uvicorn spike.render_hello:app --host 0.0.0.0 --port $PORT`. Instance type: Free. No environment variables needed.
+3. When it's live, leave it idle **longer than Render's free-tier spin-down window** (check Render's docs for the current figure; the script defaults to 20 minutes), then:
+```bash
+python -m spike.run_spike http-coldstart --url https://<your-service>.onrender.com/health --repeat 3
+```
+Attempt 1 is the cold start. A `process_age_s` near 0 in the response confirms the instance had really been asleep.
+
+## Deferred to deploy day (Tuesday)
+
 - Neon cold start measured **from Render**, with the app's exact connection string.
 - Total handler time on Render for a verified event with a cold database.
 
@@ -167,7 +178,7 @@ Paste `spike_logs/report.txt` and fill in this table:
 | 4 | Where is the merchant ID in each event type? | |
 | 5 | Does `custom_id` appear in capture webhooks? | |
 | 6 | Non-USD payments: completed, or held / pending until accepted? | |
-| 7 | Inbound payout (sender → merchant): does the merchant get any webhook? Is the note visible anywhere? | |
+| 7 | Inbound payout (sender → merchant): does the merchant's app get any webhook? (Docs say events only come from the app that processed the payment, so expect **no**.) Is the note visible in Transaction Search? | |
 | 8 | Outbound payout: which events fire, and how fast? | |
 | 9 | Transaction Search lag, upper bound (minutes until first seen, at the probe's resolution) | |
 | 10 | Does Transaction Search expose the payout note / currency conversion? | |
@@ -176,7 +187,9 @@ Paste `spike_logs/report.txt` and fill in this table:
 | 13 | provide-evidence: same request ID twice → one evidence or two? | |
 | 14 | accept-claim works in sandbox? | |
 | 15 | PayPal's first retries after 503 (times between redeliveries; full window from docs) | |
-| 16 | Verify-signature call latency and total handler time (median / max ms) | |
+| 16 | Verify-signature call latency and total handler time (median / p95 / max ms) | |
+| 16b | PayPal delivery timeout: redelivered after a 30 s delayed 200? (and 10 s if yes) | |
+| 16c | Render cold start: attempt 1 vs warm (ms) | |
 | 17 | Neon cold start: attempt-1 connect+query ms vs warm | |
 | 18 | Neon free-tier terms: compute hours, auto-suspend, any expiry | |
 | 19 | Card payment go/no-go result (COMPLETED or the error) | |

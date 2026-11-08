@@ -128,3 +128,59 @@ def test_forged_strings_are_truncated_in_unverified_records(client, verify_calls
     [record] = logged()
     for key in ("claimed_event_id", "claimed_event_type", "transmission_id"):
         assert len(record[key]) <= webhook_server.MAX_LOGGED_STRING + len("...[truncated]")
+
+
+@pytest.mark.parametrize(
+    ("event_id", "event_type"),
+    [
+        ({"nested": {"deep": "B" * 50_000}}, ["C" * 1000] * 5),
+        (12345, None),
+        ([1, 2, 3], {"a": 1}),
+    ],
+)
+def test_non_string_claimed_fields_are_reduced_and_truncated(client, verify_calls, event_id, event_type):
+    verify_calls["status"] = "FAILURE"
+    client.post(
+        "/webhooks/paypal", content=json.dumps({"id": event_id, "event_type": event_type}).encode(), headers=HEADERS
+    )
+    [record] = logged()
+    limit = webhook_server.MAX_LOGGED_STRING + len("...[truncated]")
+    for key in ("claimed_event_id", "claimed_event_type"):
+        value = record[key]
+        assert value is None or (isinstance(value, str) and len(value) <= limit)
+    assert len(json.dumps(record)) < 2000
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-le", "utf-32"])
+def test_non_utf8_json_is_rejected_as_bad_json_not_500(client, verify_calls, encoding):
+    body = json.dumps(EVENT).encode(encoding)
+    response = client.post("/webhooks/paypal", content=body, headers=HEADERS)
+    assert response.status_code == 400
+    assert verify_calls["count"] == 0
+    assert logged()[0]["outcome"] == "rejected_bad_json"
+
+
+def test_real_verify_survives_non_utf8_body_without_500(monkeypatch):
+    """Defence in depth: even if a non-UTF-8 body reached verify(), it must not raise."""
+    monkeypatch.setattr(webhook_server, "resolve_webhook_id", lambda: "WH-TEST")
+    result = webhook_server.verify(HEADERS, json.dumps(EVENT).encode("utf-16"))
+    assert result["status"] == "VERIFY_CALL_ERROR"
+
+
+def test_ack_delay_applies_to_verified_events(client, verify_calls, monkeypatch):
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(webhook_server.asyncio, "sleep", fake_sleep)
+    monkeypatch.setenv("SPIKE_ACK_DELAY_S", "30")
+    post_event(client)
+    assert slept == [30.0]
+    assert logged()[0]["ack_delay_s"] == 30.0
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("", 0.0), ("abc", 0.0), ("-5", 0.0), ("500", 120.0), ("12.5", 12.5)])
+def test_ack_delay_parsing_is_bounded(monkeypatch, raw, expected):
+    monkeypatch.setenv("SPIKE_ACK_DELAY_S", raw)
+    assert webhook_server.ack_delay_seconds() == expected

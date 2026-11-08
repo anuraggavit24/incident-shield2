@@ -16,9 +16,10 @@ import statistics
 import sys
 import time
 from collections import Counter, defaultdict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -579,7 +580,38 @@ def verified_hooks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [r for r in records if r.get("verified") is True and r.get("event_type")]
 
 
-DB_LAST_USED_FILE = LOG_DIR / "db_last_used.txt"
+MARKER_DIR = LOG_DIR / "markers"
+
+
+def read_marker(path: Path) -> datetime | None:
+    """When this script last touched a resource (None if never, or unreadable)."""
+    try:
+        return datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def write_marker(path: Path, when: datetime) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(iso(when), encoding="utf-8")
+
+
+def measure_attempts(
+    repeat: int, operation: Callable[[], dict[str, Any]], marker: Path, now: Callable[[], datetime] = utcnow
+) -> list[dict[str, Any]]:
+    """Run `operation` `repeat` times, timing each one.
+
+    The marker is written BEFORE each attempt: a failed or timed-out attempt may
+    still have woken the resource, so the next run must not count as cold.
+    Exceptions propagate after the marker is written.
+    """
+    results = []
+    for attempt in range(1, repeat + 1):
+        write_marker(marker, now())
+        started = time.perf_counter()
+        timings = operation()
+        results.append({"attempt": attempt, "total_ms": round((time.perf_counter() - started) * 1000), **timings})
+    return results
 
 
 def neon_endpoint_kind(url: str) -> str:
@@ -601,6 +633,16 @@ def idle_gate(last_used: datetime | None, now: datetime, min_idle_minutes: float
     return None
 
 
+def _gate_or_raise(marker: Path, min_idle_minutes: float) -> datetime | None:
+    last_used = read_marker(marker)
+    refusal = idle_gate(last_used, utcnow(), min_idle_minutes)
+    if refusal:
+        raise ConfigError(refusal)
+    if last_used is None:
+        print("Note: no previous run recorded, so idle time is unknown (only this script's own use is tracked).")
+    return last_used
+
+
 def cmd_db_coldstart(settings: Settings | None, args: argparse.Namespace) -> None:
     """Time connect + SELECT 1 against Postgres after the DB has been idle."""
     try:
@@ -610,36 +652,46 @@ def cmd_db_coldstart(settings: Settings | None, args: argparse.Namespace) -> Non
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
         raise ConfigError("Set DATABASE_URL in .env: the exact Neon connection string the app will use")
-    last_used = None
-    if DB_LAST_USED_FILE.exists():
-        last_used = datetime.fromisoformat(DB_LAST_USED_FILE.read_text(encoding="utf-8").strip())
-    refusal = idle_gate(last_used, utcnow(), args.min_idle_minutes)
-    if refusal:
-        raise ConfigError(refusal)
-    if last_used is None:
-        print("Note: no previous run recorded, so idle time is unknown (only this script's own use is tracked).")
+    marker = MARKER_DIR / "db_last_used.txt"
+    last_used = _gate_or_raise(marker, args.min_idle_minutes)
     kind = neon_endpoint_kind(url)
     print(f"Endpoint: {kind}. Measured from THIS machine, not from Render.")
-    for attempt in range(1, args.repeat + 1):
+
+    def connect_and_query() -> dict[str, Any]:
         started = time.perf_counter()
         with psycopg.connect(url, connect_timeout=30) as conn:
             connected = time.perf_counter()
             conn.execute("SELECT 1").fetchone()
-        done = time.perf_counter()
-        connect_ms = round((connected - started) * 1000)
-        total_ms = round((done - started) * 1000)
-        print(f"attempt {attempt}: connect={connect_ms} ms, connect+query={total_ms} ms")
+        return {"connect_ms": round((connected - started) * 1000)}
+
+    idle = round((utcnow() - last_used).total_seconds() / 60, 1) if last_used else None
+    for result in measure_attempts(args.repeat, connect_and_query, marker):
+        print(f"attempt {result['attempt']}: connect={result['connect_ms']} ms, connect+query={result['total_ms']} ms")
         finding(
             "db_coldstart",
-            attempt=attempt,
-            connect_ms=connect_ms,
-            total_ms=total_ms,
+            **result,
             endpoint=kind,
-            idle_minutes=round((utcnow() - last_used).total_seconds() / 60, 1) if last_used and attempt == 1 else None,
+            idle_minutes=idle if result["attempt"] == 1 else None,
             measured_from="local machine",
         )
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    DB_LAST_USED_FILE.write_text(iso(utcnow()), encoding="utf-8")
+
+
+def cmd_http_coldstart(settings: Settings | None, args: argparse.Namespace) -> None:
+    """Time GET requests to a deployed service after it has been idle (e.g. Render free tier spin-down)."""
+    host = urlparse(args.url).hostname or "unknown"
+    if not args.url.startswith("https://"):
+        raise ConfigError("Use the service's https URL")
+    marker = MARKER_DIR / f"http_last_used_{re.sub(r'[^A-Za-z0-9.-]', '_', host)}.txt"
+    last_used = _gate_or_raise(marker, args.min_idle_minutes)
+
+    def get() -> dict[str, Any]:
+        response = httpx.get(args.url, timeout=args.timeout)
+        return {"http_status": response.status_code}
+
+    idle = round((utcnow() - last_used).total_seconds() / 60, 1) if last_used else None
+    for result in measure_attempts(args.repeat, get, marker):
+        print(f"attempt {result['attempt']}: HTTP {result['http_status']} in {result['total_ms']} ms")
+        finding("http_coldstart", **result, url=args.url, idle_minutes=idle if result["attempt"] == 1 else None)
 
 
 def cmd_report(settings: Settings | None, args: argparse.Namespace) -> None:
@@ -806,6 +858,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-idle-minutes", type=float, default=10.0, help="refuse if this script used the DB sooner")
     p.set_defaults(func=cmd_db_coldstart)
 
+    p = sub.add_parser("http-coldstart", help="Time GETs to a deployed service after idle (Render spin-down)")
+    p.add_argument("--url", required=True, help="e.g. https://<service>.onrender.com/health")
+    p.add_argument("--repeat", type=int, default=2, help="1st attempt = cold, later ones = warm")
+    p.add_argument("--min-idle-minutes", type=float, default=20.0, help="refuse if this script hit it sooner")
+    p.add_argument("--timeout", type=float, default=120.0, help="seconds to wait for a sleeping service")
+    p.set_defaults(func=cmd_http_coldstart)
+
     sub.add_parser("report", help="Summarise everything logged so far").set_defaults(func=cmd_report)
     return parser
 
@@ -813,7 +872,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        settings = None if args.func in (cmd_report, cmd_db_coldstart) else load_settings()
+        settings = None if args.func in (cmd_report, cmd_db_coldstart, cmd_http_coldstart) else load_settings()
         args.func(settings, args)
     except ConfigError as exc:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)

@@ -17,6 +17,7 @@ answers. The tunnel URL is public.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -47,11 +48,18 @@ app = FastAPI(title="Incident Shield - sandbox spike receiver")
 MAX_LOGGED_STRING = 100
 
 
-def clip(value: Any) -> Any:
-    """Truncate attacker-controllable strings before they reach the log."""
-    if isinstance(value, str) and len(value) > MAX_LOGGED_STRING:
-        return value[:MAX_LOGGED_STRING] + "...[truncated]"
-    return value
+def clip(value: Any) -> str | None:
+    """Reduce an attacker-controllable value to a short string before it reaches the log.
+
+    Non-strings (objects, lists, numbers) are tagged with their type, so a nested
+    object can't smuggle a large payload past the limit.
+    """
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else f"[{type(value).__name__}] {value}"
+    if len(text) > MAX_LOGGED_STRING:
+        return text[:MAX_LOGGED_STRING] + "...[truncated]"
+    return text
 
 
 class BodyTooLarge(Exception):
@@ -86,7 +94,7 @@ def verify(headers: dict[str, str], raw: bytes) -> dict[str, Any]:
             content=build_verify_body(headers, raw, webhook_id),
             content_type="application/json",
         )
-    except (httpx.HTTPError, RuntimeError) as exc:  # transport failure or token failure
+    except (httpx.HTTPError, RuntimeError, ValueError) as exc:  # transport, token, or encoding failure
         return {
             "status": "VERIFY_CALL_ERROR",
             "error": repr(exc),
@@ -102,6 +110,19 @@ def verify(headers: dict[str, str], raw: bytes) -> dict[str, Any]:
             "elapsed_ms": elapsed_ms,
         }
     return {"status": body.get("verification_status", "UNKNOWN"), "elapsed_ms": elapsed_ms}
+
+
+def ack_delay_seconds() -> float:
+    """SPIKE_ACK_DELAY_S delays the answer to VERIFIED events, to find PayPal's delivery timeout.
+
+    If PayPal redelivers an event we answered 200 after N seconds, its timeout is below N.
+    Capped at 120 s.
+    """
+    try:
+        value = float(os.getenv("SPIKE_ACK_DELAY_S", "0") or 0)
+    except ValueError:
+        return 0.0
+    return max(0.0, min(value, 120.0))
 
 
 def _unverified_log_has_room() -> bool:
@@ -150,11 +171,13 @@ async def paypal_webhook(request: Request) -> JSONResponse:
         return done("rejected_too_large", 413, {"declared_bytes": clip(declared) or None}, verified=False)
 
     meta = {"size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    # Decode as UTF-8 explicitly: json.loads would also accept UTF-16/32 bytes, but the
+    # verify body splices the raw bytes as UTF-8, so anything else must be rejected here.
     try:
-        event = json.loads(raw)
-        if not isinstance(event, dict):
-            raise ValueError("event is not a JSON object")
-    except (ValueError, UnicodeDecodeError):
+        event = json.loads(raw.decode("utf-8"))
+    except ValueError:  # includes UnicodeDecodeError and JSONDecodeError
+        return done("rejected_bad_json", 400, meta, verified=False)
+    if not isinstance(event, dict):
         return done("rejected_bad_json", 400, meta, verified=False)
 
     claimed = {"claimed_event_id": clip(event.get("id")), "claimed_event_type": clip(event.get("event_type"))}
@@ -174,6 +197,10 @@ async def paypal_webhook(request: Request) -> JSONResponse:
     if not is_verified:
         return done(outcome, http_status, {**meta, **claimed, "verification": verification}, verified=False)
 
+    ack_delay = ack_delay_seconds()
+    if ack_delay:
+        await asyncio.sleep(ack_delay)
+
     created = parse_paypal_time(event.get("create_time"))
     return done(
         outcome,
@@ -187,6 +214,7 @@ async def paypal_webhook(request: Request) -> JSONResponse:
             "create_time": event.get("create_time"),
             "delivery_delay_s": round((received_at - created).total_seconds(), 1) if created else None,
             "verification": verification,
+            "ack_delay_s": ack_delay,
             "paypal_headers": {k: v for k, v in headers.items() if k.startswith("paypal-")},
             "event": event,
         },

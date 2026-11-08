@@ -142,3 +142,42 @@ def test_client_accepts_sandbox() -> None:
     client = PayPalClient(Settings("https://api-m.sandbox.paypal.com", creds, None), creds)
     assert client.base == "https://api-m.sandbox.paypal.com"
     client.close()
+
+
+# --- marker file read/write and the failed-attempt case
+
+from spike.run_spike import measure_attempts, read_marker, write_marker  # noqa: E402
+
+
+def test_marker_round_trip(tmp_path) -> None:
+    marker = tmp_path / "markers" / "db.txt"
+    assert read_marker(marker) is None
+    write_marker(marker, NOW)
+    assert read_marker(marker) == NOW
+
+
+def test_corrupt_marker_reads_as_unknown(tmp_path) -> None:
+    marker = tmp_path / "db.txt"
+    marker.write_text("not a timestamp", encoding="utf-8")
+    assert read_marker(marker) is None
+
+
+def test_failed_attempt_still_updates_marker(tmp_path) -> None:
+    marker = tmp_path / "db.txt"
+
+    def failing_connect() -> dict:
+        raise TimeoutError("connect timed out")
+
+    with pytest.raises(TimeoutError):
+        measure_attempts(3, failing_connect, marker, now=lambda: NOW)
+    # The failed connect may have woken the database, so the gate must now refuse a "cold" run.
+    assert read_marker(marker) == NOW
+    assert idle_gate(read_marker(marker), NOW + timedelta(minutes=2), 10) is not None
+
+
+def test_successful_attempts_are_timed_and_marked(tmp_path) -> None:
+    marker = tmp_path / "db.txt"
+    results = measure_attempts(2, lambda: {"connect_ms": 5}, marker, now=lambda: NOW)
+    assert [r["attempt"] for r in results] == [1, 2]
+    assert all(r["connect_ms"] == 5 and r["total_ms"] >= 0 for r in results)
+    assert read_marker(marker) == NOW
