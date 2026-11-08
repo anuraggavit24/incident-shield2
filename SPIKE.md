@@ -56,10 +56,23 @@ nano .env
 Fill in the merchant app, sender app, and card values. Then:
 
 ```bash
-pytest -q                                   # 13 safety tests must pass
+pytest -q                                   # 27 tests must pass
+ruff check .                                # must be clean
 python -m spike.run_spike token --app merchant
 python -m spike.run_spike token --app sender
 ```
+
+### Go / no-go check: do this before anything else
+
+```bash
+python -m spike.run_spike pay-card --amount 1.00 --currency USD
+```
+
+Card payments with a raw sandbox card number may need card processing enabled on the merchant account (unverified). A `422` or a permission error here means:
+- **Scripted multi-sender seeding is dead** and the seed design changes. Likely fallbacks: payouts from one or more sender business apps into the merchant, or wallet payments approved by hand.
+- Stop and send me the error output before doing the rest. The remaining steps still work, but the plan changes.
+
+If it returns `COMPLETED`, carry on.
 
 ---
 
@@ -110,11 +123,21 @@ python -m spike.run_spike accept-claim --id <dispute 1> --yes
 Disputes may take a few minutes to appear. If they never do, that is a finding too.
 
 **Retry behavior (about 15 minutes):** stop the receiver, start it again with `SPIKE_FORCE_503=1` (PowerShell: `$env:SPIKE_FORCE_503="1"`), make one card payment, then restart normally. The report lists the times each event was redelivered.
+This only measures the **first few retries**. Don't claim the full retry window as measured: take it from PayPal's webhook documentation and cite it.
+
+**Neon cold start (do this when convenient, any time today):** create a free Neon project, put its connection string in `DATABASE_URL`, leave it idle for at least 10 minutes, then:
+```bash
+python -m spike.run_spike db-coldstart --repeat 3 --idle-note "idle 10+ min"
+```
+Attempt 1 is the cold start, later attempts are warm. Compare attempt 1 with the total handler time in the report. Also note Neon's current free-tier terms (compute hours, auto-suspend delay, project or data expiry) from their pricing page.
 
 **Anytime:**
 ```bash
 python -m spike.run_spike report
 ```
+The report's answers use **signature-verified events only**. Your tunnel URL is public, so unverified requests are logged as metadata (size, hash, claimed type) and never counted.
+
+**Transaction Search lag values are upper bounds:** measured from when the script recorded the payment, at the probe's polling interval. The probe stops by itself after 3 consecutive query errors (for example a missing reporting permission), so check on it after the first poll.
 
 **Don't use the dashboard's webhook simulator.** Simulated events may not pass signature verification, which would pollute the results.
 
@@ -134,14 +157,17 @@ Paste `spike_logs/report.txt` and fill in this table:
 | 6 | Non-USD payments: completed, or held / pending until accepted? | |
 | 7 | Inbound payout (sender → merchant): does the merchant get any webhook? Is the note visible anywhere? | |
 | 8 | Outbound payout: which events fire, and how fast? | |
-| 9 | Transaction Search lag (minutes until first seen) | |
+| 9 | Transaction Search lag, upper bound (minutes until first seen, at the probe's resolution) | |
 | 10 | Does Transaction Search expose the payout note / currency conversion? | |
 | 11 | Could a buyer open an **unauthorized** dispute in sandbox? | |
 | 12 | Does the dispute include a buyer free-text message? | |
 | 13 | provide-evidence: same request ID twice → one evidence or two? | |
 | 14 | accept-claim works in sandbox? | |
-| 15 | PayPal retry schedule after 503 (times between redeliveries) | |
-| 16 | Verify-signature call latency (median ms) | |
-| 17 | Devpost rules: can one project win a main prize plus sponsor prizes? | |
+| 15 | PayPal's first retries after 503 (times between redeliveries; full window from docs) | |
+| 16 | Verify-signature call latency and total handler time (median / max ms) | |
+| 17 | Neon cold start: attempt-1 connect+query ms vs warm | |
+| 18 | Neon free-tier terms: compute hours, auto-suspend, any expiry | |
+| 19 | Card payment go/no-go result (COMPLETED or the error) | |
+| 20 | Devpost rules: can one project win a main prize plus sponsor prizes? | |
 
 These answers decide R2, R4, the sequence detector, and whether the dispute demo is real or cut.

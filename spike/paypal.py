@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 
-from .config import AppCreds, Settings
+from .config import AppCreds, Settings, assert_sandbox
 from .logs import append_jsonl
 
 
@@ -30,7 +30,8 @@ def safe_json(response: httpx.Response) -> Any:
 
 class PayPalClient:
     def __init__(self, settings: Settings, creds: AppCreds, timeout: float = 30.0) -> None:
-        self.base = settings.api_base
+        # Defence in depth: re-check the lock even though load_settings already did.
+        self.base = assert_sandbox(settings.api_base)
         self.creds = creds
         self._token: str | None = None
         self._expires_at = 0.0
@@ -109,7 +110,11 @@ class PayPalClient:
         except httpx.HTTPError as exc:
             append_jsonl(
                 "api_calls",
-                {**base_record, "transport_error": repr(exc), "elapsed_ms": round((time.perf_counter() - started) * 1000, 1)},
+                {
+                    **base_record,
+                    "transport_error": repr(exc),
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                },
             )
             raise
         append_jsonl(

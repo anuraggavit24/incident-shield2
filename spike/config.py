@@ -34,8 +34,7 @@ def assert_sandbox(url: str) -> str:
     host = (parsed.hostname or "").lower()
     if parsed.scheme != "https" or host not in SANDBOX_HOSTS:
         raise ConfigError(
-            f"Refusing non-sandbox PayPal URL {url!r}. "
-            f"Allowed: https://{', https://'.join(sorted(SANDBOX_HOSTS))}"
+            f"Refusing non-sandbox PayPal URL {url!r}. Allowed: https://{', https://'.join(sorted(SANDBOX_HOSTS))}"
         )
     if parsed.path not in ("", "/"):
         raise ConfigError(f"PAYPAL_API_BASE must not contain a path: {url!r}")

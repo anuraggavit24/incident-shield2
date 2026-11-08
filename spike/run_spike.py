@@ -11,13 +11,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import statistics
 import sys
 import time
 from collections import Counter, defaultdict
+from collections.abc import Iterator
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterator
+from typing import Any
 
 from .config import LOG_DIR, WEBHOOK_ID_FILE, ConfigError, Settings, load_settings
 from .logs import append_jsonl, iso, parse_paypal_time, read_jsonl, utcnow
@@ -26,21 +28,42 @@ from .paypal import PayPalClient, new_request_id, safe_json
 # Keys whose location inside webhook / API payloads the spike needs to learn.
 INTERESTING_KEYS = frozenset(
     {
-        "merchant_id", "payee", "payer", "payer_id", "email_address",
-        "custom_id", "invoice_id", "description", "note", "note_to_payer",
-        "transaction_note", "sender_batch_id", "sender_item_id",
-        "reason", "dispute_reason", "disputed_transactions",
-        "seller_transaction_id", "buyer_transaction_id", "currency_code",
+        "merchant_id",
+        "payee",
+        "payer",
+        "payer_id",
+        "email_address",
+        "custom_id",
+        "invoice_id",
+        "description",
+        "note",
+        "note_to_payer",
+        "transaction_note",
+        "sender_batch_id",
+        "sender_item_id",
+        "reason",
+        "dispute_reason",
+        "disputed_transactions",
+        "seller_transaction_id",
+        "buyer_transaction_id",
+        "currency_code",
     }
 )
 SCOPE_HINTS = ("dispute", "payout", "reporting", "checkout", "payments", "webhook")
 
 # Clearly fictional names for synthetic senders.
-SYNTHETIC_SENDERS = ["Test Sender Alpha", "Test Sender Bravo", "Test Sender Charlie", "Test Sender Delta", "Test Sender Echo"]
+SYNTHETIC_SENDERS = [
+    "Test Sender Alpha",
+    "Test Sender Bravo",
+    "Test Sender Charlie",
+    "Test Sender Delta",
+    "Test Sender Echo",
+]
 BURST_AMOUNTS = ["60.00", "136.43", "62.68", "90.73", "187.19"]
 
 
 # --------------------------------------------------------------------------- helpers
+
 
 def money(value: str) -> str:
     try:
@@ -56,6 +79,16 @@ def currency(value: str) -> str:
     value = value.strip().upper()
     if len(value) != 3 or not value.isalpha():
         raise argparse.ArgumentTypeError(f"not an ISO currency code: {value!r}")
+    return value
+
+
+_ID_PATTERN = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+def paypal_id(value: str) -> str:
+    """IDs end up in URL paths and file names, so only allow PayPal's ID alphabet."""
+    if not _ID_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"not a valid PayPal ID: {value!r}")
     return value
 
 
@@ -101,7 +134,7 @@ def capture_ids(order: Any) -> list[dict[str, Any]]:
     if not isinstance(order, dict):
         return out
     for unit in order.get("purchase_units", []) or []:
-        for cap in ((unit.get("payments") or {}).get("captures") or []):
+        for cap in (unit.get("payments") or {}).get("captures") or []:
             out.append({"capture_id": cap.get("id"), "status": cap.get("status")})
     return out
 
@@ -115,11 +148,15 @@ def capture_order(client: PayPalClient, order_id: str) -> Any:
 
 # --------------------------------------------------------------------------- commands
 
+
 def cmd_token(settings: Settings, args: argparse.Namespace) -> None:
     client = client_for(settings, args.app)
     client.token()
     info = client.last_token_info
-    print(f"app={args.app} app_id={info.get('app_id')} expires_in={info.get('expires_in')}s scopes={len(info.get('scopes', []))}")
+    print(
+        f"app={args.app} app_id={info.get('app_id')} expires_in={info.get('expires_in')}s "
+        f"scopes={len(info.get('scopes', []))}"
+    )
     relevant = [s for s in info.get("scopes", []) if any(h in s.lower() for h in SCOPE_HINTS)]
     for scope in relevant:
         print(f"  {scope}")
@@ -128,7 +165,7 @@ def cmd_token(settings: Settings, args: argparse.Namespace) -> None:
 
 def cmd_webhooks_list(settings: Settings, args: argparse.Namespace) -> None:
     body = show(client_for(settings, "merchant").request("GET", "/v1/notifications/webhooks"))
-    for hook in (body.get("webhooks", []) if isinstance(body, dict) else []):
+    for hook in body.get("webhooks", []) if isinstance(body, dict) else []:
         print(f"  {hook.get('id')}  {hook.get('url')}  events={len(hook.get('event_types', []))}")
 
 
@@ -138,7 +175,7 @@ def cmd_webhook_register(settings: Settings, args: argparse.Namespace) -> None:
     client = client_for(settings, "merchant")
     if args.replace:
         listing = safe_json(client.request("GET", "/v1/notifications/webhooks"))
-        for hook in (listing.get("webhooks", []) if isinstance(listing, dict) else []):
+        for hook in listing.get("webhooks", []) if isinstance(listing, dict) else []:
             response = client.request("DELETE", f"/v1/notifications/webhooks/{hook['id']}")
             print(f"deleted {hook['id']} ({hook.get('url')}): HTTP {response.status_code}")
     body = show(
@@ -158,7 +195,9 @@ def cmd_webhook_delete(settings: Settings, args: argparse.Namespace) -> None:
     show(client_for(settings, "merchant").request("DELETE", f"/v1/notifications/webhooks/{args.id}"))
 
 
-def _card_payment(client: PayPalClient, amount: str, cur: str, name: str, custom_id: str | None, description: str | None) -> None:
+def _card_payment(
+    client: PayPalClient, amount: str, cur: str, name: str, custom_id: str | None, description: str | None
+) -> None:
     number = os.getenv("SANDBOX_CARD_NUMBER", "").strip()
     expiry = os.getenv("SANDBOX_CARD_EXPIRY", "").strip()
     if not number or not expiry:
@@ -188,14 +227,21 @@ def _card_payment(client: PayPalClient, amount: str, cur: str, name: str, custom
         order = capture_order(client, order_id)
     caps = capture_ids(order)
     record_created(
-        "card_payment", order_id=order_id, captures=caps, amount=amount, currency=cur,
-        sender_name=name, custom_id=custom_id,
+        "card_payment",
+        order_id=order_id,
+        captures=caps,
+        amount=amount,
+        currency=cur,
+        sender_name=name,
+        custom_id=custom_id,
     )
     finding("card_payment_result", order_id=order_id, initial_status=status, captures=caps)
 
 
 def cmd_pay_card(settings: Settings, args: argparse.Namespace) -> None:
-    _card_payment(client_for(settings, "merchant"), args.amount, args.currency, args.name, args.custom_id, args.description)
+    _card_payment(
+        client_for(settings, "merchant"), args.amount, args.currency, args.name, args.custom_id, args.description
+    )
 
 
 def cmd_burst(settings: Settings, args: argparse.Namespace) -> None:
@@ -239,9 +285,11 @@ def cmd_pay_wallet(settings: Settings, args: argparse.Namespace) -> None:
         )
     )
     order_id = body.get("id") if isinstance(body, dict) else None
-    links = {l.get("rel"): l.get("href") for l in (body.get("links", []) if isinstance(body, dict) else [])}
+    links = {link.get("rel"): link.get("href") for link in (body.get("links", []) if isinstance(body, dict) else [])}
     approve = links.get("payer-action") or links.get("approve")
-    record_created("wallet_order", order_id=order_id, amount=args.amount, currency=args.currency, custom_id=args.custom_id)
+    record_created(
+        "wallet_order", order_id=order_id, amount=args.amount, currency=args.currency, custom_id=args.custom_id
+    )
     print(f"\n1) Open this link and log in as a sandbox PERSONAL buyer account:\n   {approve}")
     print(f"2) After approving, run:  python -m spike.run_spike capture --order-id {order_id}")
 
@@ -278,10 +326,18 @@ def cmd_payout(settings: Settings, args: argparse.Namespace) -> None:
     )
     batch_id = ((body.get("batch_header") or {}).get("payout_batch_id")) if isinstance(body, dict) else None
     record_created(
-        "payout", app=args.app, payout_batch_id=batch_id, sender_batch_id=sender_batch_id,
-        receiver=args.to, amount=args.amount, currency=args.currency, has_note=bool(args.note),
+        "payout",
+        app=args.app,
+        payout_batch_id=batch_id,
+        sender_batch_id=sender_batch_id,
+        receiver=args.to,
+        amount=args.amount,
+        currency=args.currency,
+        has_note=bool(args.note),
     )
-    print(f"\nCheck item status in ~30s:  python -m spike.run_spike payout-status --app {args.app} --batch-id {batch_id}")
+    print(
+        f"\nCheck item status in ~30s:  python -m spike.run_spike payout-status --app {args.app} --batch-id {batch_id}"
+    )
 
 
 def cmd_payout_status(settings: Settings, args: argparse.Namespace) -> None:
@@ -289,7 +345,10 @@ def cmd_payout_status(settings: Settings, args: argparse.Namespace) -> None:
     items = body.get("items", []) if isinstance(body, dict) else []
     tx_ids = []
     for item in items:
-        print(f"  item={item.get('payout_item_id')} tx={item.get('transaction_id')} status={item.get('transaction_status')}")
+        print(
+            f"  item={item.get('payout_item_id')} tx={item.get('transaction_id')} "
+            f"status={item.get('transaction_status')}"
+        )
         if item.get("transaction_id"):
             tx_ids.append(item["transaction_id"])
     if tx_ids:
@@ -297,13 +356,13 @@ def cmd_payout_status(settings: Settings, args: argparse.Namespace) -> None:
 
 
 def cmd_disputes_list(settings: Settings, args: argparse.Namespace) -> None:
-    body = show(
-        client_for(settings, "merchant").request("GET", "/v1/customer/disputes", params={"page_size": 50})
-    )
-    for d in (body.get("items", []) if isinstance(body, dict) else []):
+    body = show(client_for(settings, "merchant").request("GET", "/v1/customer/disputes", params={"page_size": 50}))
+    for d in body.get("items", []) if isinstance(body, dict) else []:
         amount = d.get("dispute_amount") or {}
-        print(f"  {d.get('dispute_id')}  reason={d.get('reason')}  status={d.get('status')}  "
-              f"{amount.get('value')} {amount.get('currency_code')}  created={d.get('create_time')}")
+        print(
+            f"  {d.get('dispute_id')}  reason={d.get('reason')}  status={d.get('status')}  "
+            f"{amount.get('value')} {amount.get('currency_code')}  created={d.get('create_time')}"
+        )
 
 
 def cmd_dispute_show(settings: Settings, args: argparse.Namespace) -> None:
@@ -318,9 +377,12 @@ def cmd_dispute_show(settings: Settings, args: argparse.Namespace) -> None:
         for link in body.get("links", []) or []:
             print(f"  action link: {link.get('rel')}  {link.get('method')}")
         finding(
-            "dispute_shape", dispute_id=args.id, reason=body.get("reason"), status=body.get("status"),
+            "dispute_shape",
+            dispute_id=args.id,
+            reason=body.get("reason"),
+            status=body.get("status"),
             has_buyer_messages=bool(body.get("messages")),
-            action_links=[l.get("rel") for l in body.get("links", []) or []],
+            action_links=[link.get("rel") for link in body.get("links", []) or []],
         )
 
 
@@ -339,7 +401,9 @@ def cmd_evidence_probe(settings: Settings, args: argparse.Namespace) -> None:
     """Send the same evidence twice with the same PayPal-Request-Id and compare."""
     client = client_for(settings, "merchant")
     request_id = new_request_id()
-    payload = {"evidences": [{"evidence_type": "OTHER", "notes": "Incident Shield spike: request-ID idempotency probe."}]}
+    payload = {
+        "evidences": [{"evidence_type": "OTHER", "notes": "Incident Shield spike: request-ID idempotency probe."}]
+    }
     results = []
     for attempt in (1, 2):
         print(f"--- provide-evidence attempt {attempt} (PayPal-Request-Id {request_id})")
@@ -371,13 +435,18 @@ def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
     client = client_for(settings, "merchant")
     seen = {r["transaction_id"] for r in read_jsonl("txsearch") if r.get("event") == "first_seen"}
     deadline = time.monotonic() + args.hours * 3600
+    consecutive_errors = 0
     print(f"Polling Transaction Search every {args.interval}s for up to {args.hours}h. Ctrl+C to stop.")
+    print(
+        "Reported lag is an UPPER BOUND: measured from when this script recorded the payment, "
+        f"with {args.interval // 60}-minute resolution."
+    )
     while True:
         end = utcnow() - timedelta(minutes=1)
         start = end - timedelta(hours=args.lookback_hours)
         targets = _txsearch_targets()
         found: dict[str, Any] = {}
-        page, total_pages = 1, 1
+        page, total_pages, query_failed = 1, 1, False
         while page <= total_pages:
             response = client.request(
                 "GET",
@@ -394,6 +463,7 @@ def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
             if response.status_code != 200 or not isinstance(body, dict):
                 append_jsonl("txsearch", {"event": "query_error", "status": response.status_code, "body": body})
                 print(f"  query error HTTP {response.status_code} (see spike_logs/txsearch.jsonl)")
+                query_failed = True
                 break
             total_pages = int(body.get("total_pages") or 1)
             for detail in body.get("transaction_details", []) or []:
@@ -401,6 +471,18 @@ def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
                 if tx_id:
                     found[tx_id] = detail
             page += 1
+
+        if query_failed:
+            consecutive_errors += 1
+            if consecutive_errors >= args.max_errors:
+                finding("txsearch_aborted", consecutive_errors=consecutive_errors)
+                print(
+                    f"ABORTING: {consecutive_errors} consecutive query errors. Check the app has "
+                    "Transaction search enabled and the token has a reporting scope (run: token)."
+                )
+                return
+        else:
+            consecutive_errors = 0
 
         now = utcnow()
         for tx_id, created_at in targets.items():
@@ -416,30 +498,75 @@ def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
                         "created_at": created_at,
                         "seen_at": iso(now),
                         "lag_minutes_upper_bound": lag,
+                        "resolution_minutes": round(args.interval / 60, 1),
                         "transaction_info_keys": sorted((detail.get("transaction_info") or {}).keys()),
                         "payer_info_keys": sorted((detail.get("payer_info") or {}).keys()),
                         "detail": detail,
                     },
                 )
                 seen.add(tx_id)
-                print(f"  FIRST SEEN {tx_id}: lag <= {lag} min")
+                print(f"  FIRST SEEN {tx_id}: lag <= {lag} min (upper bound)")
         missing = [t for t in targets if t not in seen]
-        print(f"[{iso(now)}] targets={len(targets)} seen={len(seen & set(targets))} still_missing={len(missing)} "
-              f"(window has {len(found)} transactions)")
+        print(
+            f"[{iso(now)}] targets={len(targets)} seen={len(seen & set(targets))} still_missing={len(missing)} "
+            f"(window has {len(found)} transactions)"
+        )
         if time.monotonic() >= deadline:
             break
         time.sleep(args.interval)
 
 
+def verified_hooks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Only signature-verified deliveries may feed the spike's answers."""
+    return [r for r in records if r.get("verified") is True and r.get("event_type")]
+
+
+def cmd_db_coldstart(settings: Settings | None, args: argparse.Namespace) -> None:
+    """Time connect + SELECT 1 against Postgres (run once after the DB has been idle)."""
+    try:
+        import psycopg
+    except ImportError as exc:
+        raise ConfigError("pip install -r requirements-spike.txt (needs psycopg)") from exc
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        raise ConfigError("Set DATABASE_URL in .env (Neon connection string)")
+    for attempt in range(1, args.repeat + 1):
+        started = time.perf_counter()
+        with psycopg.connect(url, connect_timeout=30) as conn:
+            connected = time.perf_counter()
+            conn.execute("SELECT 1").fetchone()
+        done = time.perf_counter()
+        connect_ms = round((connected - started) * 1000)
+        total_ms = round((done - started) * 1000)
+        print(f"attempt {attempt}: connect={connect_ms} ms, connect+query={total_ms} ms")
+        finding("db_coldstart", attempt=attempt, connect_ms=connect_ms, total_ms=total_ms, idle_note=args.idle_note)
+
+
 def cmd_report(settings: Settings | None, args: argparse.Namespace) -> None:
     lines: list[str] = []
     out = lines.append
-    hooks = [h for h in read_jsonl("webhooks") if h.get("event_type")]
-    out(f"== Webhooks: {len(hooks)} deliveries")
+    records = read_jsonl("webhooks")
+    hooks = verified_hooks(records)
+    out(f"== Webhooks: {len(records)} requests received, {len(hooks)} VERIFIED")
+    out("  (everything below except 'outcomes' and 'verification' uses verified events only)")
+    out("  outcomes:     " + ", ".join(f"{k}={v}" for k, v in Counter(r.get("outcome") for r in records).items()))
+    out(
+        "  verification: "
+        + ", ".join(
+            f"{k}={v}"
+            for k, v in Counter(
+                (r.get("verification") or {}).get("status") for r in records if r.get("verification")
+            ).items()
+        )
+    )
     for name, count in Counter(h["event_type"] for h in hooks).most_common():
         out(f"  {count:3d}  {name}")
-    out("  verification: " + ", ".join(f"{k}={v}" for k, v in Counter(h["verification"]["status"] for h in hooks).items()))
-    out("  outcomes:     " + ", ".join(f"{k}={v}" for k, v in Counter(h["outcome"] for h in hooks).items()))
+    handler_ms = [r["handler_ms"] for r in records if isinstance(r.get("handler_ms"), (int, float))]
+    if handler_ms:
+        out(
+            f"  total handler ms (time until PayPal gets an answer): median={statistics.median(handler_ms):.0f} "
+            f"max={max(handler_ms):.0f}"
+        )
     delays = [h["delivery_delay_s"] for h in hooks if isinstance(h.get("delivery_delay_s"), (int, float))]
     if delays:
         out(f"  delivery delay s: median={statistics.median(delays):.1f} max={max(delays):.1f}")
@@ -464,10 +591,13 @@ def cmd_report(settings: Settings | None, args: argparse.Namespace) -> None:
             out(f"    {entry}")
 
     tx = [r for r in read_jsonl("txsearch") if r.get("event") == "first_seen"]
-    out(f"\n== Transaction Search: {len(tx)} transactions first-seen")
+    out(f"\n== Transaction Search: {len(tx)} transactions first-seen (lag values are upper bounds)")
     for r in tx:
-        out(f"  {r['transaction_id']}: lag <= {r.get('lag_minutes_upper_bound')} min; "
-            f"transaction_info keys={r.get('transaction_info_keys')}")
+        out(
+            f"  {r['transaction_id']}: lag <= {r.get('lag_minutes_upper_bound')} min "
+            f"(resolution {r.get('resolution_minutes')} min); "
+            f"transaction_info keys={r.get('transaction_info_keys')}"
+        )
     missing = [t for t in _txsearch_targets() if t not in {r["transaction_id"] for r in tx}]
     out(f"  not yet seen: {missing}")
 
@@ -486,9 +616,11 @@ def cmd_report(settings: Settings | None, args: argparse.Namespace) -> None:
 
 # --------------------------------------------------------------------------- CLI
 
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m spike.run_spike", description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        prog="python -m spike.run_spike", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("token", help="Get an OAuth token and list relevant scopes")
@@ -503,7 +635,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_webhook_register)
 
     p = sub.add_parser("webhook-delete", help="Delete one webhook")
-    p.add_argument("--id", required=True)
+    p.add_argument("--id", required=True, type=paypal_id)
     p.set_defaults(func=cmd_webhook_delete)
 
     p = sub.add_parser("pay-card", help="Inbound payment via sandbox card (no buyer login needed)")
@@ -528,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_pay_wallet)
 
     p = sub.add_parser("capture", help="Capture an approved order")
-    p.add_argument("--order-id", required=True)
+    p.add_argument("--order-id", required=True, type=paypal_id)
     p.set_defaults(func=cmd_capture)
 
     p = sub.add_parser("payout", help="Send money out (merchant) or in (sender app) via Payouts")
@@ -541,30 +673,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("payout-status", help="Show payout items and record their transaction IDs")
     p.add_argument("--app", choices=["merchant", "sender"], default="merchant")
-    p.add_argument("--batch-id", required=True)
+    p.add_argument("--batch-id", required=True, type=paypal_id)
     p.set_defaults(func=cmd_payout_status)
 
     sub.add_parser("disputes-list", help="List disputes on the merchant account").set_defaults(func=cmd_disputes_list)
 
     p = sub.add_parser("dispute-show", help="Show one dispute and save its full body")
-    p.add_argument("--id", required=True)
+    p.add_argument("--id", required=True, type=paypal_id)
     p.set_defaults(func=cmd_dispute_show)
 
     p = sub.add_parser("accept-claim", help="Accept a dispute claim (irreversible)")
-    p.add_argument("--id", required=True)
+    p.add_argument("--id", required=True, type=paypal_id)
     p.add_argument("--note", default="Incident Shield spike: accepting claim.")
     p.add_argument("--yes", action="store_true")
     p.set_defaults(func=cmd_accept_claim)
 
     p = sub.add_parser("evidence-probe", help="Test PayPal-Request-Id idempotency on provide-evidence")
-    p.add_argument("--id", required=True)
+    p.add_argument("--id", required=True, type=paypal_id)
     p.set_defaults(func=cmd_evidence_probe)
 
     p = sub.add_parser("txsearch-probe", help="Measure Transaction Search lag for created transactions")
     p.add_argument("--interval", type=int, default=600, help="seconds between polls")
     p.add_argument("--hours", type=float, default=6.0)
     p.add_argument("--lookback-hours", type=float, default=48.0)
+    p.add_argument("--max-errors", type=int, default=3, help="abort after this many consecutive query errors")
     p.set_defaults(func=cmd_txsearch_probe)
+
+    p = sub.add_parser("db-coldstart", help="Time Postgres connect + query (run after the DB has idled)")
+    p.add_argument("--repeat", type=int, default=2, help="1st attempt = cold, later ones = warm")
+    p.add_argument("--idle-note", default="", help="e.g. 'idle 10 min'")
+    p.set_defaults(func=cmd_db_coldstart)
 
     sub.add_parser("report", help="Summarise everything logged so far").set_defaults(func=cmd_report)
     return parser
@@ -573,7 +711,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        settings = None if args.func is cmd_report else load_settings()
+        settings = None if args.func in (cmd_report, cmd_db_coldstart) else load_settings()
         args.func(settings, args)
     except ConfigError as exc:
         print(f"CONFIG ERROR: {exc}", file=sys.stderr)

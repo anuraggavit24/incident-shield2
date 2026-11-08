@@ -27,12 +27,12 @@ def test_sandbox_lock_accepts_sandbox(url: str) -> None:
 @pytest.mark.parametrize(
     "url",
     [
-        "https://api-m.paypal.com",                       # production
-        "https://api.paypal.com",                         # production (legacy host)
-        "http://api-m.sandbox.paypal.com",                # not https
+        "https://api-m.paypal.com",  # production
+        "https://api.paypal.com",  # production (legacy host)
+        "http://api-m.sandbox.paypal.com",  # not https
         "https://api-m.sandbox.paypal.com.evil.example",  # lookalike host
         "https://evil.example/api-m.sandbox.paypal.com",  # host in path
-        "https://api-m.sandbox.paypal.com/v1",            # base must not carry a path
+        "https://api-m.sandbox.paypal.com/v1",  # base must not carry a path
         "",
     ],
 )
