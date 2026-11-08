@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 
 from spike.config import AppCreds, ConfigError, Settings
@@ -162,22 +163,77 @@ def test_corrupt_marker_reads_as_unknown(tmp_path) -> None:
     assert read_marker(marker) is None
 
 
-def test_failed_attempt_still_updates_marker(tmp_path) -> None:
+def test_failed_attempt_is_recorded_and_still_updates_marker(tmp_path) -> None:
     marker = tmp_path / "db.txt"
 
     def failing_connect() -> dict:
         raise TimeoutError("connect timed out")
 
-    with pytest.raises(TimeoutError):
-        measure_attempts(3, failing_connect, marker, now=lambda: NOW)
+    results = measure_attempts(2, failing_connect, marker, now=lambda: NOW)
+    assert [r["ok"] for r in results] == [False, False]
+    assert results[0]["error_type"] == "TimeoutError"
+    assert "timed out" in results[0]["error"]
     # The failed connect may have woken the database, so the gate must now refuse a "cold" run.
     assert read_marker(marker) == NOW
     assert idle_gate(read_marker(marker), NOW + timedelta(minutes=2), 10) is not None
+
+
+def test_timeout_on_first_attempt_then_success(tmp_path) -> None:
+    calls = {"n": 0}
+
+    def flaky() -> dict:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadTimeout("timed out waiting for sleeping service")
+        return {"http_status": 200}
+
+    results = measure_attempts(2, flaky, tmp_path / "m.txt", now=lambda: NOW)
+    assert results[0]["ok"] is False and results[0]["error_type"] == "ReadTimeout"
+    assert results[1]["ok"] is True and results[1]["http_status"] == 200
 
 
 def test_successful_attempts_are_timed_and_marked(tmp_path) -> None:
     marker = tmp_path / "db.txt"
     results = measure_attempts(2, lambda: {"connect_ms": 5}, marker, now=lambda: NOW)
     assert [r["attempt"] for r in results] == [1, 2]
-    assert all(r["connect_ms"] == 5 and r["total_ms"] >= 0 for r in results)
+    assert all(r["ok"] and r["connect_ms"] == 5 and r["total_ms"] >= 0 for r in results)
     assert read_marker(marker) == NOW
+
+
+# --- cold-start classification and process age parsing
+
+from spike.run_spike import NOT_COLD_AFTER_S, coldness, process_age_from, timing_hooks  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("attempt", "age", "expected"),
+    [
+        (1, 0.4, "cold"),
+        (1, NOT_COLD_AFTER_S, "cold"),
+        (1, NOT_COLD_AFTER_S + 1, "NOT COLD"),
+        (1, 3600.0, "NOT COLD"),
+        (1, None, "UNCONFIRMED"),
+        (2, 0.4, "warm"),
+    ],
+)
+def test_coldness(attempt, age, expected) -> None:
+    assert coldness(attempt, age) == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [(b'{"process_age_s": 1.5}', 1.5), (b'{"process_age_s": "x"}', None), (b"not json", None), (b"[1]", None)],
+)
+def test_process_age_from(body, expected) -> None:
+    response = httpx.Response(200, content=body)
+    assert process_age_from(response) == expected
+
+
+def test_timing_stats_exclude_experiments() -> None:
+    hooks = [
+        {"handler_ms": 300.0, "outcome": "accepted", "ack_delay_s": 0.0},
+        {"handler_ms": 30_400.0, "outcome": "accepted", "ack_delay_s": 30.0},
+        {"handler_ms": 250.0, "outcome": "forced_503", "ack_delay_s": 0.0},
+        {"handler_ms": 320.0, "outcome": "accepted"},
+    ]
+    assert [h["handler_ms"] for h in timing_hooks(hooks)] == [300.0, 320.0]

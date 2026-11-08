@@ -145,7 +145,13 @@ The probe keeps going through 401/403 errors for the first 4 hours (`--auth-grac
 
 **Don't use the dashboard's webhook simulator.** Simulated events may not pass signature verification, which would pollute the results.
 
-**PayPal's delivery timeout (optional, about 30 minutes, mostly waiting):** PayPal's docs give the retry rule (any non-2xx response is retried up to 25 times over 3 days) but not how long PayPal waits for an answer. To find out, restart the receiver with `SPIKE_ACK_DELAY_S=30`, make one card payment, and wait. If PayPal redelivers an event we answered 200 after 30 s, its timeout is under 30 s. Try 10 s next if so. The report's "redelivered events" section shows it.
+**PayPal's delivery timeout (optional, mostly waiting).** PayPal's webhook docs (https://developer.paypal.com/api/rest/webhooks/) give the retry rule: any non-2xx response is retried up to 25 times over 3 days. They don't say how long PayPal waits for an answer. Measure it:
+1. **Do the 503 retry test first.** It gives you the gap before PayPal's first retry. Call it G.
+2. Restart the receiver with `SPIKE_ACK_DELAY_S=30`, make one card payment, and wait **at least 2 × G** (never less than 15 minutes). A missing redelivery only means something if you've waited past the point where a retry would have arrived.
+3. Repeat with `SPIKE_ACK_DELAY_S=10`, using a new payment.
+4. A redelivery of an event we answered 200 after N seconds means PayPal's timeout is under N. One payment produces a few events, so each run gives a few samples, not one.
+
+These runs are excluded from the handler-time stats automatically.
 
 ### Render cold start: do this today (about 15 minutes of your time, plus idle waiting)
 
@@ -157,7 +163,7 @@ The ack-before-processing design and the 503 retry assumptions depend on this nu
 ```bash
 python -m spike.run_spike http-coldstart --url https://<your-service>.onrender.com/health --repeat 3
 ```
-Attempt 1 is the cold start. A `process_age_s` near 0 in the response confirms the instance had really been asleep.
+Attempt 1 is the cold start. The script reads `process_age_s` from the response and labels attempt 1 **cold** only if the process is under 2 minutes old. **NOT COLD** means the instance never spun down, so wait longer and re-run. A timeout is recorded as that attempt's result, not a crash: it's the most important outcome this can produce.
 
 ## Deferred to deploy day (Tuesday)
 
@@ -178,7 +184,7 @@ Paste `spike_logs/report.txt` and fill in this table:
 | 4 | Where is the merchant ID in each event type? | |
 | 5 | Does `custom_id` appear in capture webhooks? | |
 | 6 | Non-USD payments: completed, or held / pending until accepted? | |
-| 7 | Inbound payout (sender → merchant): does the merchant's app get any webhook? (Docs say events only come from the app that processed the payment, so expect **no**.) Is the note visible in Transaction Search? | |
+| 7 | Inbound payout (sender → merchant): does the merchant's app get any webhook? Expected **no**: PayPal's webhook docs (https://developer.paypal.com/api/rest/webhooks/) say only events associated with the specific app are received. Verify in sandbox. Is the note visible in Transaction Search? | |
 | 8 | Outbound payout: which events fire, and how fast? | |
 | 9 | Transaction Search lag, upper bound (minutes until first seen, at the probe's resolution) | |
 | 10 | Does Transaction Search expose the payout note / currency conversion? | |
@@ -188,7 +194,7 @@ Paste `spike_logs/report.txt` and fill in this table:
 | 14 | accept-claim works in sandbox? | |
 | 15 | PayPal's first retries after 503 (times between redeliveries; full window from docs) | |
 | 16 | Verify-signature call latency and total handler time (median / p95 / max ms) | |
-| 16b | PayPal delivery timeout: redelivered after a 30 s delayed 200? (and 10 s if yes) | |
+| 16b | PayPal delivery timeout: first-retry gap G, then redelivered after a 30 s and a 10 s delayed 200? (waited ≥ 2 × G each) | |
 | 16c | Render cold start: attempt 1 vs warm (ms) | |
 | 17 | Neon cold start: attempt-1 connect+query ms vs warm | |
 | 18 | Neon free-tier terms: compute hours, auto-suspend, any expiry | |

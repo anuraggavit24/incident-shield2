@@ -575,6 +575,21 @@ def first_deliveries(hooks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(earliest.values())
 
 
+def timing_hooks(hooks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Verified deliveries usable for handler-time stats.
+
+    Excludes the timeout experiment (deliberate ack delay) and forced-503 runs,
+    which measure PayPal, not our handler.
+    """
+    return [
+        h
+        for h in hooks
+        if isinstance(h.get("handler_ms"), (int, float))
+        and not h.get("ack_delay_s")
+        and h.get("outcome") != "forced_503"
+    ]
+
+
 def verified_hooks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Only signature-verified deliveries may feed the spike's answers."""
     return [r for r in records if r.get("verified") is True and r.get("event_type")]
@@ -603,15 +618,35 @@ def measure_attempts(
 
     The marker is written BEFORE each attempt: a failed or timed-out attempt may
     still have woken the resource, so the next run must not count as cold.
-    Exceptions propagate after the marker is written.
+    A failure (timeout, refused connection, ...) is recorded as that attempt's
+    outcome instead of crashing: a cold-start timeout is the most important result.
     """
     results = []
     for attempt in range(1, repeat + 1):
         write_marker(marker, now())
         started = time.perf_counter()
-        timings = operation()
-        results.append({"attempt": attempt, "total_ms": round((time.perf_counter() - started) * 1000), **timings})
+        try:
+            outcome: dict[str, Any] = {"ok": True, **operation()}
+        except Exception as exc:  # noqa: BLE001 - any failure is a measurement to record, not a crash
+            outcome = {"ok": False, "error_type": type(exc).__name__, "error": str(exc)[:300]}
+        results.append({"attempt": attempt, "total_ms": round((time.perf_counter() - started) * 1000), **outcome})
     return results
+
+
+NOT_COLD_AFTER_S = 120.0
+
+
+def coldness(attempt: int, process_age_s: float | None) -> str:
+    """Classify a cold-start attempt using the service's own process age.
+
+    Attempt 1 with a process older than NOT_COLD_AFTER_S means the instance never
+    spun down, so the number is a warm start, whatever the idle time.
+    """
+    if attempt != 1:
+        return "warm"
+    if process_age_s is None:
+        return "UNCONFIRMED"
+    return "cold" if process_age_s <= NOT_COLD_AFTER_S else "NOT COLD"
 
 
 def neon_endpoint_kind(url: str) -> str:
@@ -666,7 +701,15 @@ def cmd_db_coldstart(settings: Settings | None, args: argparse.Namespace) -> Non
 
     idle = round((utcnow() - last_used).total_seconds() / 60, 1) if last_used else None
     for result in measure_attempts(args.repeat, connect_and_query, marker):
-        print(f"attempt {result['attempt']}: connect={result['connect_ms']} ms, connect+query={result['total_ms']} ms")
+        if result["ok"]:
+            print(
+                f"attempt {result['attempt']}: connect={result['connect_ms']} ms, connect+query={result['total_ms']} ms"
+            )
+        else:
+            print(
+                f"attempt {result['attempt']}: FAILED after {result['total_ms']} ms: "
+                f"{result['error_type']}: {result['error']}"
+            )
         finding(
             "db_coldstart",
             **result,
@@ -674,6 +717,14 @@ def cmd_db_coldstart(settings: Settings | None, args: argparse.Namespace) -> Non
             idle_minutes=idle if result["attempt"] == 1 else None,
             measured_from="local machine",
         )
+
+
+def process_age_from(response: httpx.Response) -> float | None:
+    try:
+        value = response.json().get("process_age_s")
+    except (ValueError, AttributeError):
+        return None
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 def cmd_http_coldstart(settings: Settings | None, args: argparse.Namespace) -> None:
@@ -686,12 +737,29 @@ def cmd_http_coldstart(settings: Settings | None, args: argparse.Namespace) -> N
 
     def get() -> dict[str, Any]:
         response = httpx.get(args.url, timeout=args.timeout)
-        return {"http_status": response.status_code}
+        return {"http_status": response.status_code, "process_age_s": process_age_from(response)}
 
     idle = round((utcnow() - last_used).total_seconds() / 60, 1) if last_used else None
     for result in measure_attempts(args.repeat, get, marker):
-        print(f"attempt {result['attempt']}: HTTP {result['http_status']} in {result['total_ms']} ms")
-        finding("http_coldstart", **result, url=args.url, idle_minutes=idle if result["attempt"] == 1 else None)
+        attempt = result["attempt"]
+        if result["ok"]:
+            label = coldness(attempt, result["process_age_s"])
+            print(
+                f"attempt {attempt}: HTTP {result['http_status']} in {result['total_ms']} ms "
+                f"(process_age_s={result['process_age_s']}) -> {label}"
+            )
+            if label == "NOT COLD":
+                print("  The instance never spun down: this is a WARM number. Wait longer and re-run.")
+        else:
+            label = "FAILED"
+            print(f"attempt {attempt}: FAILED after {result['total_ms']} ms: {result['error_type']}: {result['error']}")
+        finding(
+            "http_coldstart",
+            **result,
+            classification=label,
+            url=args.url,
+            idle_minutes=idle if attempt == 1 else None,
+        )
 
 
 def cmd_report(settings: Settings | None, args: argparse.Namespace) -> None:
@@ -713,9 +781,12 @@ def cmd_report(settings: Settings | None, args: argparse.Namespace) -> None:
     )
     for name, count in Counter(h["event_type"] for h in hooks).most_common():
         out(f"  {count:3d}  {name}")
-    handler_ms = [h["handler_ms"] for h in hooks if isinstance(h.get("handler_ms"), (int, float))]
+    handler_ms = [h["handler_ms"] for h in timing_hooks(hooks)]
     if handler_ms:
-        out(f"  total handler ms, verified only (time until PayPal gets an answer): {summarize(handler_ms)}")
+        out(
+            "  total handler ms, verified, excluding experiment runs (time until PayPal gets an answer): "
+            f"{summarize(handler_ms)}"
+        )
     delays = [
         h["delivery_delay_s"] for h in first_deliveries(hooks) if isinstance(h.get("delivery_delay_s"), (int, float))
     ]
