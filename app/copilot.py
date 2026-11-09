@@ -165,6 +165,19 @@ class LLMError(RuntimeError):
     pass
 
 
+def _google_reason(response: httpx.Response) -> str:
+    """Google's status and reason code (e.g. UNAUTHENTICATED / ACCESS_TOKEN_TYPE_UNSUPPORTED).
+    Only those fields: never the message text, which could someday echo request details."""
+    try:
+        error = response.json().get("error", {})
+        reasons = [d.get("reason") for d in error.get("details", []) if isinstance(d, dict) and d.get("reason")]
+        parts = [str(error.get("status") or "")] + [str(r) for r in reasons]
+        text = " / ".join(p for p in parts if p)
+        return f" ({text})" if text else ""
+    except (ValueError, AttributeError):
+        return ""
+
+
 class GeminiLLM:
     """Gemini via REST with a JSON response schema. No tools are ever passed."""
 
@@ -193,7 +206,7 @@ class GeminiLLM:
         except httpx.HTTPError as exc:
             raise LLMError(f"Gemini request failed: {exc!r}") from exc
         if response.status_code != 200:
-            raise LLMError(f"Gemini HTTP {response.status_code}")
+            raise LLMError(f"Gemini HTTP {response.status_code}{_google_reason(response)}")
         try:
             text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
             parsed = json.loads(text)

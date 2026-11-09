@@ -481,3 +481,23 @@ def test_copilot_may_quote_the_r2_thresholds() -> None:
         "Money moving out counts only at 80% of new money and at least $5, unless the recipient had 2 earlier payouts."
     )
     assert check_interpretation(text, facts) == []
+
+
+def test_gemini_errors_show_googles_reason_code() -> None:
+    import httpx
+
+    from app.copilot import GeminiLLM, LLMError
+
+    body = {
+        "error": {
+            "code": 401,
+            "status": "UNAUTHENTICATED",
+            "message": "Request had invalid authentication credentials.",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "ACCESS_TOKEN_TYPE_UNSUPPORTED"}
+            ],
+        }
+    }
+    llm = GeminiLLM("k", "m", transport=httpx.MockTransport(lambda r: httpx.Response(401, json=body)))
+    with pytest.raises(LLMError, match="401 \\(UNAUTHENTICATED / ACCESS_TOKEN_TYPE_UNSUPPORTED\\)"):
+        llm.generate("s", "u", {})
