@@ -504,22 +504,30 @@ _FORBIDDEN_VERDICTS = re.compile(r"\b(?:" + "|".join(_FORBIDDEN_PATTERNS) + r")\
 #   "fraud is NOT confirmed fraud"            -> a negated "confirmed fraud" is the answer we want
 #   "check it matches YOUR normal business"   -> advice about the owner's business, not a verdict
 #   "ordinary sales activity CAN also cause this" -> a hedge the partial-pattern meaning itself states
-# A bare verdict ("This is normal business.", "Confirmed fraud.") is still blocked.
+#   "confirm WHETHER these were legitimate" / "TO CONFIRM they're legitimate sales" -> telling the
+#       owner what to check, not a verdict
+# A bare verdict ("This is normal business.", "Confirmed fraud.", "If you know them, they are
+# legitimate.") is still blocked.
 _CERTAINTY_CLAIM = re.compile(r"(?:confirmed|proven)\s", re.IGNORECASE)
 _NOUN_VERDICT = re.compile(r"(?:normal|ordinary|routine|typical|genuine|legitimate|regular)\s", re.IGNORECASE)
 _NEGATION_BEFORE = re.compile(r"\b(?:not|no|never|than|n't)\s+(?:\w+\s+){0,2}$", re.IGNORECASE)
 _HEDGE = re.compile(r"\b(?:can|could|may|might)\b", re.IGNORECASE)
+_CLEARING_VERB = re.compile(r"(?:is|are|looks?|seems?|appears?|was|were)\s", re.IGNORECASE)
+_OWNER_CHECK = re.compile(r"\b(?:whether|to\s+(?:confirm|check|verify|see))\b", re.IGNORECASE)
 
 
 def _exempt(text: str, match: re.Match[str]) -> bool:
     phrase = match.group(0)
     before = text[max(0, match.start() - 30) : match.start()]
+    sentence_start = max(text.rfind(".", 0, match.start()), text.rfind("!", 0, match.start())) + 1
+    owner_check = bool(_OWNER_CHECK.search(text[sentence_start : match.start()]))
     if _CERTAINTY_CLAIM.match(phrase):
         return bool(_NEGATION_BEFORE.search(before))
+    if _CLEARING_VERB.match(phrase):
+        return owner_check
     if _NOUN_VERDICT.match(phrase):
-        if re.search(r"\byour\s+$", before, re.IGNORECASE):
+        if owner_check or re.search(r"\byour\s+$", before, re.IGNORECASE):
             return True
-        sentence_start = max(text.rfind(".", 0, match.start()), text.rfind("!", 0, match.start())) + 1
         sentence_end = min(
             (i for i in (text.find(".", match.end()), text.find("!", match.end())) if i != -1), default=len(text)
         )

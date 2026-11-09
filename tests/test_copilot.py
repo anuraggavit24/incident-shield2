@@ -567,6 +567,9 @@ def test_timeout_falls_back_and_both_failures_are_reported() -> None:
         "Check whether these payments align with your normal business.",
         "Ordinary sales activity can also produce this pattern, so it needs review.",
         "It could be ordinary sales from new customers.",
+        # second real run (2026-11-09)
+        "Check if you recognize all counterparties and confirm whether these were legitimate transactions.",
+        "Check your order records and buyer information to confirm these payments correspond to legitimate sales.",
     ],
 )
 def test_hedged_or_negated_phrasings_pass(text) -> None:
@@ -584,6 +587,9 @@ def test_hedged_or_negated_phrasings_pass(text) -> None:
         "Just regular payments from customers.",
         "Your account shows confirmed fraud.",
         "It's normal business, and you can ignore it.",
+        "These were legitimate transactions.",
+        "If you recognise them, they are legitimate.",
+        "We confirm these are legitimate sales.",
     ],
 )
 def test_plain_verdicts_are_still_blocked(text) -> None:
