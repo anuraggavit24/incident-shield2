@@ -99,6 +99,11 @@ def paypal_id(value: str) -> str:
 def client_for(settings: Settings, app: str) -> PayPalClient:
     if app == "merchant":
         return PayPalClient(settings, settings.merchant)
+    if app == "reporting":
+        if settings.reporting is None:
+            print("Note: REPORTING_CLIENT_ID not set, using the merchant app for Transaction Search.")
+            return PayPalClient(settings, settings.merchant)
+        return PayPalClient(settings, settings.reporting)
     if settings.sender is None:
         raise ConfigError("SENDER_CLIENT_ID / SENDER_CLIENT_SECRET are not set in .env")
     return PayPalClient(settings, settings.sender)
@@ -193,6 +198,31 @@ def cmd_webhook_register(settings: Settings, args: argparse.Namespace) -> None:
         WEBHOOK_ID_FILE.write_text(webhook_id, encoding="utf-8")
         print(f"\nRegistered webhook {webhook_id}. The receiver picks it up automatically (no restart needed).")
         finding("webhook_registered", webhook_id=webhook_id, url=args.url)
+
+
+def cmd_webhook_events(settings: Settings, args: argparse.Namespace) -> None:
+    """List webhook events PayPal has generated for the merchant app (independent of delivery)."""
+    response = client_for(settings, "merchant").request(
+        "GET", "/v1/notifications/webhooks-events", params={"page_size": args.page_size}
+    )
+    body = safe_json(response)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    (LOG_DIR / "webhook_events_list.json").write_text(json.dumps(body, indent=2), encoding="utf-8")
+    print(f"HTTP {response.status_code}. Full body saved to spike_logs/webhook_events_list.json")
+    events = body.get("events", []) if isinstance(body, dict) else []
+    print(f"{len(events)} events generated for this app (newest first):")
+    for event in events:
+        resource = event.get("resource") or {}
+        print(
+            f"  {event.get('create_time')}  {event.get('event_type')}  id={event.get('id')}  "
+            f"resource_id={resource.get('id')}  status={event.get('status', '-')}"
+        )
+    finding(
+        "webhook_events_generated",
+        http_status=response.status_code,
+        count=len(events),
+        types=sorted({str(e.get("event_type")) for e in events}),
+    )
 
 
 def cmd_webhook_delete(settings: Settings, args: argparse.Namespace) -> None:
@@ -464,7 +494,7 @@ def _txsearch_targets() -> dict[str, str]:
 
 
 def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
-    client = client_for(settings, "merchant")
+    client = client_for(settings, "reporting")
     seen = {r["transaction_id"] for r in read_jsonl("txsearch") if r.get("event") == "first_seen"}
     started = time.monotonic()
     deadline = started + args.hours * 3600
@@ -503,7 +533,15 @@ def cmd_txsearch_probe(settings: Settings, args: argparse.Namespace) -> None:
             body = safe_json(response)
             if response.status_code != 200 or not isinstance(body, dict):
                 append_jsonl("txsearch", {"event": "query_error", "status": response.status_code, "body": body})
-                hint = " (auth: tolerated during grace period)" if response.status_code in AUTH_STATUSES else ""
+                if response.status_code in AUTH_STATUSES:
+                    # Scopes are baked into a token at issue time: refetch so a newly
+                    # enabled permission is picked up on the next poll.
+                    client.invalidate_token()
+                hint = (
+                    " (auth: token refreshed, tolerated during grace period)"
+                    if response.status_code in AUTH_STATUSES
+                    else ""
+                )
                 print(f"  query error HTTP {response.status_code}{hint} (see spike_logs/txsearch.jsonl)")
                 failed_status, query_failed = response.status_code, True
                 break
@@ -846,7 +884,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("token", help="Get an OAuth token and list relevant scopes")
-    p.add_argument("--app", choices=["merchant", "sender"], default="merchant")
+    p.add_argument("--app", choices=["merchant", "sender", "reporting"], default="merchant")
     p.set_defaults(func=cmd_token)
 
     sub.add_parser("webhooks-list", help="List webhooks on the merchant app").set_defaults(func=cmd_webhooks_list)
@@ -855,6 +893,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url", required=True, help="https://<tunnel>/webhooks/paypal")
     p.add_argument("--replace", action="store_true", help="Delete existing webhooks on the app first")
     p.set_defaults(func=cmd_webhook_register)
+
+    p = sub.add_parser("webhook-events", help="List events PayPal generated for the merchant app")
+    p.add_argument("--page-size", type=int, default=20)
+    p.set_defaults(func=cmd_webhook_events)
 
     p = sub.add_parser("webhook-delete", help="Delete one webhook")
     p.add_argument("--id", required=True, type=paypal_id)

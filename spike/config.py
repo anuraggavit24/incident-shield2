@@ -60,6 +60,7 @@ class Settings:
     api_base: str
     merchant: AppCreds
     sender: AppCreds | None
+    reporting: AppCreds | None = None
 
 
 def load_settings() -> Settings:
@@ -72,7 +73,13 @@ def load_settings() -> Settings:
     sender_id = os.getenv("SENDER_CLIENT_ID", "").strip()
     sender_secret = os.getenv("SENDER_CLIENT_SECRET", "").strip()
     sender = AppCreds("sender", sender_id, sender_secret) if sender_id and sender_secret else None
-    return Settings(api_base=api_base, merchant=merchant, sender=sender)
+    # Optional second app on the SAME merchant account, used only for Transaction Search.
+    # PayPal reuses an access token (and its scopes) until it expires, so an app whose
+    # token was issued before a permission was enabled can't pick it up for hours.
+    rep_id = os.getenv("REPORTING_CLIENT_ID", "").strip()
+    rep_secret = os.getenv("REPORTING_CLIENT_SECRET", "").strip()
+    reporting = AppCreds("reporting", rep_id, rep_secret) if rep_id and rep_secret else None
+    return Settings(api_base=api_base, merchant=merchant, sender=sender, reporting=reporting)
 
 
 def resolve_webhook_id() -> str:

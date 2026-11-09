@@ -20,3 +20,16 @@ def isolated_logs(tmp_path, monkeypatch):
     monkeypatch.setattr(logs, "LOG_DIR", tmp_path)
     monkeypatch.delenv("SPIKE_FORCE_503", raising=False)
     return tmp_path
+
+
+# --- application settings for tests (must be set before app.config.get_settings is first called)
+import hashlib  # noqa: E402
+
+TEST_OWNER_KEY = "test-owner-key"
+# Tests ALWAYS use TEST_DATABASE_URL (never the app's DATABASE_URL from .env), and the DB tests
+# refuse any database whose name doesn't contain "test".
+os.environ["DATABASE_URL"] = os.environ.get(
+    "TEST_DATABASE_URL", "postgresql://postgres@localhost:55432/shield_test?host=/tmp"
+)
+os.environ.setdefault("OWNER_API_KEY_SHA256", hashlib.sha256(TEST_OWNER_KEY.encode()).hexdigest())
+os.environ.setdefault("PROCESS_INTERVAL_S", "3600")  # tests drive processing explicitly

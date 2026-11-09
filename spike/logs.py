@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import LOG_DIR
@@ -14,7 +14,7 @@ SENSITIVE_KEYS = frozenset(
 
 
 def utcnow() -> datetime:
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)
 
 
 def iso(dt: datetime) -> str:
@@ -60,4 +60,4 @@ def parse_paypal_time(value: str | None) -> datetime | None:
         dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)

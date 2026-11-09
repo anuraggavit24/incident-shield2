@@ -41,6 +41,12 @@ class PayPalClient:
     def close(self) -> None:
         self._http.close()
 
+    def invalidate_token(self) -> None:
+        """Drop the cached token. A token's scopes are fixed when it's issued, so after a
+        permission change (or a 401/403) only a fresh token can pick up the new scopes."""
+        self._token = None
+        self._expires_at = 0.0
+
     def token(self) -> str:
         if self._token and time.monotonic() < self._expires_at - 60:
             return self._token

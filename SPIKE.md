@@ -31,12 +31,12 @@ Note each account's email. Sandbox passwords are visible on the account's detail
 
 ## 1. Local setup
 
-You need Python 3.11 or newer, Git, and `cloudflared` (https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
+You need Python 3.10 or newer, Git, and `cloudflared` (https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/).
 
 **Windows (PowerShell):**
 ```powershell
 cd incident-shield
-py -3.12 -m venv .venv
+python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements-spike.txt
 copy .env.example .env

@@ -4,7 +4,7 @@ statistics, the cold-start idle gate, and the client-level sandbox lock."""
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -96,7 +96,7 @@ def test_first_deliveries_ignores_redeliveries() -> None:
 
 # --- cold-start helpers
 
-NOW = datetime(2026, 11, 7, 12, 0, tzinfo=UTC)
+NOW = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
 
 
 def test_idle_gate_allows_first_run() -> None:
@@ -237,3 +237,35 @@ def test_timing_stats_exclude_experiments() -> None:
         {"handler_ms": 320.0, "outcome": "accepted"},
     ]
     assert [h["handler_ms"] for h in timing_hooks(hooks)] == [300.0, 320.0]
+
+
+def test_invalidate_token_forces_refetch() -> None:
+    creds = AppCreds("merchant", "id", "secret")
+    client = PayPalClient(Settings("https://api-m.sandbox.paypal.com", creds, None), creds)
+    client._token = "old-token-without-new-scopes"
+    client._expires_at = float("inf")
+    client.invalidate_token()
+    assert client._token is None
+    assert client._expires_at == 0.0
+    client.close()
+
+
+def test_reporting_app_falls_back_to_merchant_when_unset() -> None:
+    from spike.run_spike import client_for
+
+    merchant = AppCreds("merchant", "m-id", "m-secret")
+    settings = Settings("https://api-m.sandbox.paypal.com", merchant, None)
+    client = client_for(settings, "reporting")
+    assert client.creds.label == "merchant"
+    client.close()
+
+
+def test_reporting_app_used_when_set() -> None:
+    from spike.run_spike import client_for
+
+    merchant = AppCreds("merchant", "m-id", "m-secret")
+    reporting = AppCreds("reporting", "r-id", "r-secret")
+    settings = Settings("https://api-m.sandbox.paypal.com", merchant, None, reporting)
+    client = client_for(settings, "reporting")
+    assert client.creds.label == "reporting"
+    client.close()
