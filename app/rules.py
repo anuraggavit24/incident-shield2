@@ -29,8 +29,9 @@ class RuleConfig:
     passthrough_window: timedelta = timedelta(minutes=60)
     # Mules move out most of what arrives; a shop paying a supplier usually doesn't.
     passthrough_min_ratio: Decimal = Decimal("0.8")
-    # A recipient is "established" only with enough paid history that faking it costs real money:
-    # at least this many earlier payouts, together worth at least this share of the new payout.
+    # A recipient is "established" only with at least this many earlier payouts, together worth at
+    # least this share of the new payout, so one tiny warm-up payment isn't enough.
+    # This is NOT attacker-proof: paying your own cash-out account first costs nothing (see README).
     established_min_payouts: int = 2
     established_min_share: Decimal = Decimal("0.5")
     probe_max_usd: Decimal = Decimal("1.00")

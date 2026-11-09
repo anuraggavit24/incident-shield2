@@ -225,9 +225,16 @@ async def paypal_webhook(request: Request, background: BackgroundTasks) -> JSONR
     expected_merchant = get_settings().paypal_merchant_id
     payee = payee_merchant_id(event)
     # A valid signature proves PayPal sent it, not that it's about OUR account: park mismatches.
-    # Events with no payee are payouts this app sent; PayPal only delivers events from the app the
-    # webhook is registered to, so their account is fixed by the registration itself.
-    quarantined = payee is not None and payee != expected_merchant
+    # Captures always name their payee (every real sandbox capture did), so a capture without one is
+    # parked too. Payout events never carry a payee; PayPal only delivers events from the app the
+    # webhook is registered to, so a payout's account is fixed by the registration itself.
+    event_type = str(event.get("event_type", ""))
+    if payee is None:
+        quarantined = event_type.startswith("PAYMENT.CAPTURE.")
+        reason = f"{event_type} has no payee merchant ID"
+    else:
+        quarantined = payee != expected_merchant
+        reason = f"payee merchant {payee} is not {expected_merchant}"
     row = WebhookEvent(
         event_id=event["id"][:128],
         event_type=str(event.get("event_type", ""))[:128],
@@ -235,7 +242,7 @@ async def paypal_webhook(request: Request, background: BackgroundTasks) -> JSONR
         event_created_at=parse_time(event.get("create_time")),
         payload=event,
         status="quarantined" if quarantined else "pending",
-        last_error=f"payee merchant {payee} is not {expected_merchant}" if quarantined else None,
+        last_error=reason if quarantined else None,
     )
     try:
         with db.session_scope() as session:

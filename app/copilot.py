@@ -171,8 +171,11 @@ class GeminiLLM:
             "generationConfig": {
                 "responseMimeType": "application/json",
                 "responseSchema": schema,
-                "temperature": 0.2,
-                "maxOutputTokens": 600,
+                # No temperature/top_p/top_k: Gemini 3.x ignores them and newer models reject them.
+                # maxOutputTokens also counts thinking tokens, so keep thinking low and the cap roomy;
+                # the 120-word answer limit is enforced by the prompt and the post-hoc checks.
+                "thinkingConfig": {"thinkingLevel": "low"},
+                "maxOutputTokens": 4096,
             },
         }
         try:

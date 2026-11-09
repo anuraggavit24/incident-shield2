@@ -1,7 +1,7 @@
 """List the Gemini models your GEMINI_API_KEY can call with generateContent.
 
 Usage:  python scripts/list_gemini_models.py
-Pick one and set GEMINI_MODEL in .env (default: gemini-3.5-flash).
+Pick one and set GEMINI_MODEL in .env (default: gemini-3.8-flash).
 """
 
 import os
@@ -22,7 +22,7 @@ response = httpx.get(
 )
 if response.status_code != 200:
     sys.exit(f"HTTP {response.status_code}: {response.text[:300]}")
-configured = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+configured = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 names = sorted(
     m["name"].removeprefix("models/")
     for m in response.json().get("models", [])

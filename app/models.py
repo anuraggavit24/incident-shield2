@@ -73,7 +73,7 @@ class Incident(Base):
     status: Mapped[str] = mapped_column(String(24), default="detected")
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    # e.g. "mule:<64-hex>" or "indicators:2026-11-08"
+    # e.g. "mule:<64-hex>" (the earliest probe's key when the incident was first opened)
     dedupe_key: Mapped[str] = mapped_column(String(128), unique=True)
 
 

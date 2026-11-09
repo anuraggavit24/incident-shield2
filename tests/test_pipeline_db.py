@@ -341,3 +341,65 @@ def test_bigger_burst_after_the_mule_forms_replaces_the_old_hit_inside_it() -> N
             a.action for a in session.scalars(select(IncidentEvent).where(IncidentEvent.incident_id == mules[0].id))
         ]
     assert "rule_hit_superseded" in audit
+
+
+def test_busy_hour_on_an_account_with_history_opens_no_incident() -> None:
+    """Review round 3, finding 2: with history R1 turns medium, but one rule alone never opens an incident."""
+    names = {f"H{i}": f"Regular {i}" for i in range(4)} | {f"N{i}": f"New Buyer {i}" for i in range(3)}
+    events = [capture(f"WH-HIST0{i}", i, "25.00", f"H{i}") for i in range(4)]  # 10:00-10:03, history
+    events += [
+        payout("WH-HSUP01", 5, "61.00", "supplier@example.com"),
+        payout("WH-HSUP02", 6, "61.00", "supplier@example.com"),
+    ]
+    later = "2026-11-10T11:{m:02d}:00Z"
+    for i, minute in enumerate((20, 25, 30)):
+        e = capture(f"WH-NEWB0{i}", 0, "40.00", f"N{i}")
+        e["create_time"] = e["resource"]["create_time"] = later.format(m=minute)
+        events.append(e)
+    final = payout("WH-HSUP03", 0, "61.00", "supplier@example.com")
+    final["create_time"] = final["resource"]["time_processed"] = later.format(m=35)
+    events.append(final)
+    store(events)
+    process_pending(card_lookup(names))
+    with db.session_scope() as session:
+        r1 = session.scalars(select(RuleHit).where(RuleHit.rule_id == "R1_BURST_NEW_SENDERS")).all()
+        # The history phase is itself 4 first-time buyers (a low hit); the busy hour is medium.
+        assert "medium" in {h.severity for h in r1}
+        assert session.scalars(select(Incident)).all() == []
+
+
+def test_late_earlier_probe_joins_the_existing_incident() -> None:
+    """Review round 4: a late webhook that reveals an EARLIER probe must not open a second incident."""
+    names = {"P1": "Probe One", "P0": "Probe Zero", "A": "Payer A", "B": "Payer B", "C": "Payer C"}
+    lookup = card_lookup(names)
+    store(
+        [
+            capture("WH-PR0001", 5, "0.79", "P1"),
+            capture("WH-AAAA01", 6, "100.00", "A"),
+            capture("WH-BBBB01", 7, "100.00", "B"),
+            capture("WH-CCCC01", 8, "100.00", "C"),
+            payout("WH-OUTT01", 10, "290.00", "exchange@example.com"),
+        ]
+    )
+    process_pending(lookup)
+    store([capture("WH-PR0000", 1, "0.60", "P0")])  # earlier probe, delivered late
+    process_pending(lookup)
+    with db.session_scope() as session:
+        mules = session.scalars(select(Incident).where(Incident.kind == "money_mule_pattern")).all()
+        assert len(mules) == 1
+        linked = session.scalars(
+            select(RuleHit).where(RuleHit.incident_id == mules[0].id, RuleHit.superseded_by.is_(None))
+        ).all()
+        assert {h.rule_id for h in linked} >= {"R1_BURST_NEW_SENDERS", "R2_PASS_THROUGH", "R3_PROBE_PAYMENT"}
+
+
+def test_demo_seed_opens_one_high_severity_incident_and_is_repeatable() -> None:
+    from scripts import demo_seed
+
+    first = demo_seed.seed()
+    second = demo_seed.seed()
+    assert first and first == second
+    with db.session_scope() as session:
+        mules = session.scalars(select(Incident).where(Incident.kind == "money_mule_pattern")).all()
+        assert len(mules) == 1
+        assert mules[0].severity == "high"

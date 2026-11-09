@@ -263,25 +263,11 @@ def _get_or_create_incident(session: Session, dedupe_key: str, kind: str, severi
     return incident
 
 
-def attach_hits(session: Session, new_hits: list[RuleHit], as_of: datetime) -> None:
-    """Group medium/high hits into an indicator incident for the day, then look for the mule sequence.
+def open_sequence_incident(session: Session, as_of: datetime) -> None:
+    """Open an incident only for the full probe -> burst -> out sequence.
 
-    Low-severity hits are stored (GET /rule-hits) but don't open an incident on their own: a small
-    sale or a few new customers is normal business. They still count toward the mule sequence."""
-    for hit in new_hits:
-        if hit.incident_id is not None or hit.superseded_by is not None:
-            continue
-        if SEVERITY_ORDER[hit.severity] < SEVERITY_ORDER["medium"]:
-            continue
-        day_key = f"indicators:{hit.window_end.astimezone(timezone.utc).date().isoformat()}"
-        incident = _get_or_create_incident(session, day_key, "risk_indicators", hit.severity, as_of)
-        hit.incident_id = incident.id
-        if SEVERITY_ORDER[hit.severity] > SEVERITY_ORDER[incident.severity]:
-            incident.severity = hit.severity
-        incident.updated_at = as_of
-        _log(session, incident, "rule_hit_attached", {"rule_id": hit.rule_id, "rule_hit_id": hit.id})
-    session.flush()
-
+    A single rule firing is stored and listed at GET /rule-hits, but never opens an incident: R1 has
+    no per-account baseline, so a busy sales hour from new customers looks exactly like a burst."""
     candidates = session.scalars(
         select(RuleHit).where(
             RuleHit.window_end >= as_of - 3 * DEFAULT_CONFIG.sequence_max_gap, RuleHit.superseded_by.is_(None)
@@ -293,8 +279,28 @@ def attach_hits(session: Session, new_hits: list[RuleHit], as_of: datetime) -> N
         return
     # Without enough history, "new sender" may include regular customers: say so in the severity.
     severity = "high" if match.burst.values.get("history") == "ok" else "medium"
-    mule = _get_or_create_incident(session, f"mule:{match.probe.dedupe_key}", "money_mule_pattern", severity, as_of)
-    for step, hit in (("probe", match.probe), ("burst", match.burst), ("passthrough", match.passthrough)):
+    steps = (("probe", match.probe), ("burst", match.burst), ("passthrough", match.passthrough))
+    # A late webhook can reveal an EARLIER probe for a pattern that already has an incident. Keying
+    # only on the earliest probe would then open a second incident for the same pattern, so reuse
+    # the oldest incident any of the three matched hits is already linked to.
+    linked_ids = [by_key[h.dedupe_key].incident_id for _, h in steps if by_key[h.dedupe_key].incident_id is not None]
+    existing = (
+        session.scalar(
+            select(Incident)
+            .where(Incident.id.in_(linked_ids), Incident.kind == "money_mule_pattern")
+            .order_by(Incident.id)
+            .limit(1)
+        )
+        if linked_ids
+        else None
+    )
+    mule = existing or _get_or_create_incident(
+        session, f"mule:{match.probe.dedupe_key}", "money_mule_pattern", severity, as_of
+    )
+    if existing is not None and severity == "high" and mule.severity != "high":
+        mule.severity = "high"
+        _log(session, mule, "severity_raised", {"severity": "high"})
+    for step, hit in steps:
         row = by_key[hit.dedupe_key]
         if row.incident_id == mule.id:
             continue
@@ -329,10 +335,9 @@ def process_event(session: Session, event: WebhookEvent, lookup: OrderLookup | N
     normalized, flags = _with_identity(normalized, lookup, event.attempts)
     txn = upsert_transaction(session, normalized, event.event_created_at, flags)
     times = evaluation_times(session, txn)
-    hits: list[RuleHit] = []
     for as_of in times:
-        hits.extend(run_rules(session, as_of))
-    attach_hits(session, hits, times[-1])
+        run_rules(session, as_of)
+    open_sequence_incident(session, times[-1])
     return "processed"
 
 

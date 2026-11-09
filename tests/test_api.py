@@ -184,6 +184,18 @@ def test_event_for_another_merchant_is_quarantined_not_processed(client) -> None
     assert [e["event_id"] for e in listed] == ["WH-FOREIGN-1"]
 
 
+def test_capture_without_a_payee_is_quarantined(client) -> None:
+    import copy
+
+    bare = copy.deepcopy(next(e for e in EVENTS if e["event_type"] == "PAYMENT.CAPTURE.COMPLETED"))
+    bare["id"] = "WH-NOPAYEE-1"
+    del bare["resource"]["payee"]
+    assert post(client, bare).json() == {"outcome": "quarantined"}
+    with db.session_scope() as session:
+        event = session.scalar(select(WebhookEvent).where(WebhookEvent.event_id == "WH-NOPAYEE-1"))
+        assert event.status == "quarantined" and "no payee" in event.last_error
+
+
 def test_payout_events_without_a_payee_are_not_quarantined(client) -> None:
     payout = next(e for e in EVENTS if e["event_type"] == "PAYMENT.PAYOUTS-ITEM.SUCCEEDED")
     assert post(client, payout).json() == {"outcome": "accepted"}

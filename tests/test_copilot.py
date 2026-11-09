@@ -443,3 +443,23 @@ def test_correct_counts_in_context_pass() -> None:
     facts = build_facts(record)
     assert check_interpretation("Four new senders made 4 payments within 30 minutes.", facts) == []
     assert check_interpretation("Two new senders made 4 payments.", facts) != []
+
+
+def test_gemini_request_has_no_sampling_params_and_room_for_thinking() -> None:
+    """Gemini 3.x ignores/rejects temperature; maxOutputTokens includes thinking tokens."""
+    import httpx
+
+    from app.copilot import GeminiLLM
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": '{"ok": true}'}]}}]})
+
+    llm = GeminiLLM("key", "gemini-3.8-flash", transport=httpx.MockTransport(handler))
+    assert llm.generate("sys", "user", {"type": "OBJECT"}) == {"ok": True}
+    config = seen["generationConfig"]
+    assert "temperature" not in config and "topP" not in config and "topK" not in config
+    assert config["thinkingConfig"] == {"thinkingLevel": "low"}
+    assert config["maxOutputTokens"] >= 2048

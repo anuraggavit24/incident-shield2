@@ -113,7 +113,7 @@ def main() -> int:
     if not key:
         print("GEMINI_API_KEY is not set in .env")
         return 1
-    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
     llm = GeminiLLM(key, model)
     record = build_record()
     facts = build_facts(record)
