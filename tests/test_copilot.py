@@ -472,3 +472,12 @@ def test_model_is_told_what_a_partial_pattern_means() -> None:
     facts = build_facts(record)
     assert facts.for_model["incident_kind_meaning"] == KIND_MEANING["partial_pattern"]
     assert "TWO of the three" in _user_prompt(facts, "why_flagged", None)
+
+
+def test_copilot_may_quote_the_r2_thresholds() -> None:
+    record = {"id": 3, "kind": "partial_pattern", "severity": "low", "transactions": [], "rule_hits": []}
+    facts = build_facts(record)
+    text = (
+        "Money moving out counts only at 80% of new money and at least $5, unless the recipient had 2 earlier payouts."
+    )
+    assert check_interpretation(text, facts) == []

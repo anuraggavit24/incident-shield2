@@ -346,6 +346,8 @@ def build_facts(record: dict[str, Any]) -> Facts:
         cfg.currency_min_distinct,
         int(cfg.passthrough_min_ratio * 100),
         cfg.passthrough_min_ratio,
+        cfg.passthrough_min_usd,
+        cfg.established_min_payouts,
         len(txns),
         len(hits),
         record["id"],
