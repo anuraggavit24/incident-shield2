@@ -62,6 +62,9 @@ class Settings:
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.5-flash"
     copilot_daily_budget: int = 40
+    paypal_merchant_id: str = ""
+    webhook_rate_per_minute: int = 300
+    verify_concurrency: int = 4
 
 
 def hash_api_key(raw: str) -> str:
@@ -84,4 +87,8 @@ def get_settings() -> Settings:
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip(),
         copilot_daily_budget=int(os.getenv("COPILOT_DAILY_BUDGET", "40")),
+        # Required: a valid signature proves PayPal sent an event, not that it's about this account.
+        paypal_merchant_id=_require("PAYPAL_MERCHANT_ID"),
+        webhook_rate_per_minute=int(os.getenv("WEBHOOK_RATE_PER_MINUTE", "300")),
+        verify_concurrency=int(os.getenv("VERIFY_CONCURRENCY", "4")),
     )

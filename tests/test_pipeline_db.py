@@ -125,15 +125,21 @@ def test_real_sandbox_events_produce_transactions_with_identities() -> None:
 
 
 def test_real_sandbox_burst_raises_indicators_but_not_the_mule_pattern() -> None:
-    """In the real spike run only $50 left against ~$381 in: not a pass-through."""
+    """In the real spike run only $50 left against ~$381 in: not a pass-through.
+
+    The fresh sandbox account has no history, so every hit is low severity: stored and visible,
+    but no incident is opened for it on its own (review round 2, finding 3)."""
     store(EVENTS)
     process_pending(lookup)
     with db.session_scope() as session:
-        rules = {h.rule_id for h in session.scalars(select(RuleHit))}
+        hits = session.scalars(select(RuleHit)).all()
         kinds = {i.kind for i in session.scalars(select(Incident))}
+    rules = {h.rule_id for h in hits}
     assert {"R1_BURST_NEW_SENDERS", "R3_PROBE_PAYMENT", "R4_CURRENCY_MIX"} <= rules
     assert "R2_PASS_THROUGH" not in rules
-    assert kinds == {"risk_indicators"}
+    assert {h.severity for h in hits} == {"low"}
+    assert all(h.incident_id is None for h in hits)
+    assert kinds == set()
 
 
 def test_large_outflow_completes_the_mule_sequence() -> None:
@@ -145,7 +151,8 @@ def test_large_outflow_completes_the_mule_sequence() -> None:
     process_pending(lookup)
     with db.session_scope() as session:
         mule = session.scalar(select(Incident).where(Incident.kind == "money_mule_pattern"))
-        assert mule is not None and mule.severity == "high"
+        # The fixture account has no earlier history, so the pattern is reported at medium, not high.
+        assert mule is not None and mule.severity == "medium"
         linked = session.scalars(select(RuleHit).where(RuleHit.incident_id == mule.id)).all()
         audit = session.scalars(select(IncidentEvent).where(IncidentEvent.incident_id == mule.id)).all()
     assert {h.rule_id for h in linked} == {"R1_BURST_NEW_SENDERS", "R2_PASS_THROUGH", "R3_PROBE_PAYMENT"}
@@ -164,12 +171,18 @@ def test_reprocessing_is_idempotent() -> None:
     assert len(keys) == len(set(keys))
 
 
-def test_failed_identity_lookup_does_not_block_detection() -> None:
+def test_failed_identity_lookup_is_retried_then_detection_goes_ahead() -> None:
     def broken(_order_id: str) -> dict:
         raise TimeoutError("PayPal down")
 
     store(EVENTS)
-    assert process_pending(broken) == 12
+    process_pending(broken)  # attempt 1: captures wait for a retry
+    with db.session_scope() as session:
+        assert session.scalar(select(Transaction)) is not None  # the payout (no lookup needed) went ahead
+        waiting = session.scalars(select(WebhookEvent).where(WebhookEvent.status == "failed")).all()
+    assert len(waiting) == 8 and all("will retry" in e.last_error for e in waiting)
+    process_pending(broken)  # attempt 2: still waiting
+    process_pending(broken)  # attempt 3: gives up on identity, processes anyway
     with db.session_scope() as session:
         txn = session.scalar(select(Transaction).where(Transaction.paypal_id == "6JB34600M49183205"))
         rules = {h.rule_id for h in session.scalars(select(RuleHit))}
@@ -186,3 +199,145 @@ def test_malformed_event_is_marked_failed_and_retried_later() -> None:
     with db.session_scope() as session:
         event = session.scalar(select(WebhookEvent).where(WebhookEvent.event_id == "WH-BAD"))
     assert event.status == "failed" and event.attempts == 1 and "bad amount" in event.last_error
+
+
+# --------------------------------------------------------------------------- review findings (synthetic events)
+
+BASE = "2026-11-10T10:{m:02d}:00Z"
+
+
+def capture(event_id: str, minute: int, amount: str, order_id: str, currency: str = "USD") -> dict:
+    return {
+        "id": event_id,
+        "event_type": "PAYMENT.CAPTURE.COMPLETED",
+        "create_time": BASE.format(m=minute),
+        "resource": {
+            "id": f"CAP{event_id[-6:]}",
+            "amount": {"currency_code": currency, "value": amount},
+            "status": "COMPLETED",
+            "create_time": BASE.format(m=minute),
+            "supplementary_data": {"related_ids": {"order_id": order_id}},
+        },
+    }
+
+
+def payout(event_id: str, minute: int, amount: str, receiver: str) -> dict:
+    return {
+        "id": event_id,
+        "event_type": "PAYMENT.PAYOUTS-ITEM.SUCCEEDED",
+        "create_time": BASE.format(m=minute),
+        "resource": {
+            "transaction_id": f"OUT{event_id[-6:]}",
+            "transaction_status": "SUCCESS",
+            "time_processed": BASE.format(m=minute),
+            "payout_item": {"amount": {"currency": "USD", "value": amount}, "receiver": receiver},
+        },
+    }
+
+
+def card_lookup(names: dict[str, str]):
+    return lambda order_id: {
+        "payment_source": {"card": {"name": names[order_id], "last_digits": "4242", "brand": "VISA"}}
+    }
+
+
+def rule_ids_in_db() -> set[str]:
+    with db.session_scope() as session:
+        return {h.rule_id for h in session.scalars(select(RuleHit).where(RuleHit.superseded_by.is_(None)))}
+
+
+def test_late_arriving_event_still_completes_the_burst() -> None:
+    """Three new senders at 10:00, 10:10, 10:20, with the 10:10 webhook delivered last."""
+    names = {"O1": "Payer One", "O2": "Payer Two", "O3": "Payer Three"}
+    lookup = card_lookup(names)
+    store([capture("WH-000001", 0, "50.00", "O1"), capture("WH-000003", 20, "50.00", "O3")])
+    process_pending(lookup)
+    assert "R1_BURST_NEW_SENDERS" not in rule_ids_in_db()  # only two senders so far
+    store([capture("WH-000002", 10, "50.00", "O2")])  # the late one
+    process_pending(lookup)
+    assert "R1_BURST_NEW_SENDERS" in rule_ids_in_db()
+
+
+def test_ordinary_seller_end_to_end_gets_no_mule_incident() -> None:
+    """Supplier was paid twice an hour earlier (established), then a sales day and a $110 payout to it.
+
+    $110 of $120.50 would clear the 80% bar, so this only passes because the DB query finds the
+    supplier's earlier paid history."""
+    names = {f"S{i}": f"Customer {i}" for i in range(4)}
+    events = [
+        payout("WH-SUP001", 0, "61.00", "supplier@example.com"),  # 10:00, earlier relationship
+        payout("WH-SUP003", 2, "61.00", "supplier@example.com"),
+    ]
+    # the sales day starts 65+ minutes later: reuse BASE with minutes 65..85 via hour rollover
+    later = "2026-11-10T11:{m:02d}:00Z"
+    for i, (amount, minute) in enumerate([("0.50", 5), ("40.00", 10), ("40.00", 15), ("40.00", 20)]):
+        e = capture(f"WH-SALE0{i}", 0, amount, f"S{i}")
+        e["create_time"] = e["resource"]["create_time"] = later.format(m=minute)
+        events.append(e)
+    final = payout("WH-SUP002", 0, "110.00", "supplier@example.com")
+    final["create_time"] = final["resource"]["time_processed"] = later.format(m=25)
+    events.append(final)
+    store(events)
+    process_pending(card_lookup(names))
+    with db.session_scope() as session:
+        kinds = {i.kind for i in session.scalars(select(Incident))}
+    assert "money_mule_pattern" not in kinds
+    assert "R2_PASS_THROUGH" not in rule_ids_in_db()
+
+
+def test_one_earlier_dollar_payout_does_not_hide_the_drain() -> None:
+    """Review round 2, finding 1: pay the exchange $1 an hour early so it looks like a known recipient."""
+    later = "2026-11-10T11:{m:02d}:00Z"
+    names = {"P": "Probe Payer", "A": "Payer A", "B": "Payer B", "C": "Payer C"}
+    events = [payout("WH-WARM01", 0, "1.00", "exchange@example.com")]
+    for event_id, minute, amount, order in [
+        ("WH-EVPRB1", 5, "0.79", "P"),
+        ("WH-EVA001", 10, "100.00", "A"),
+        ("WH-EVB001", 11, "100.00", "B"),
+        ("WH-EVC001", 12, "100.00", "C"),
+    ]:
+        e = capture(event_id, 0, amount, order)
+        e["create_time"] = e["resource"]["create_time"] = later.format(m=minute)
+        events.append(e)
+    drain = payout("WH-DRAIN1", 0, "290.00", "exchange@example.com")
+    drain["create_time"] = drain["resource"]["time_processed"] = later.format(m=15)
+    events.append(drain)
+    store(events)
+    process_pending(card_lookup(names))
+    assert "R2_PASS_THROUGH" in rule_ids_in_db()
+    with db.session_scope() as session:
+        assert session.scalar(select(Incident).where(Incident.kind == "money_mule_pattern")) is not None
+
+
+def mule_scenario() -> tuple[list[dict], dict[str, str]]:
+    names = {"P": "Probe Payer", "A": "Payer A", "B": "Payer B", "C": "Payer C", "D": "Payer D"}
+    events = [
+        capture("WH-MUPRB1", 0, "0.79", "P"),
+        capture("WH-MUA001", 5, "100.00", "A"),
+        capture("WH-MUB001", 6, "100.00", "B"),
+        capture("WH-MUC001", 7, "100.00", "C"),
+        payout("WH-MUOUT1", 9, "290.00", "exchange@example.com"),
+    ]
+    return events, names
+
+
+def test_bigger_burst_after_the_mule_forms_replaces_the_old_hit_inside_it() -> None:
+    """Review round 2, finding 4: a fourth new sender arrives after the mule incident exists."""
+    events, names = mule_scenario()
+    store(events)
+    process_pending(card_lookup(names))
+    store([capture("WH-MUD001", 12, "20.00", "D")])
+    process_pending(card_lookup(names))
+    with db.session_scope() as session:
+        mules = session.scalars(select(Incident).where(Incident.kind == "money_mule_pattern")).all()
+        assert len(mules) == 1
+        active_r1 = session.scalars(
+            select(RuleHit).where(RuleHit.rule_id == "R1_BURST_NEW_SENDERS", RuleHit.superseded_by.is_(None))
+        ).all()
+        assert len(active_r1) == 1
+        assert active_r1[0].incident_id == mules[0].id
+        assert "CAPMUD001" in active_r1[0].transaction_ids  # the late fourth sender is in the surviving hit
+        audit = [
+            a.action for a in session.scalars(select(IncidentEvent).where(IncidentEvent.incident_id == mules[0].id))
+        ]
+    assert "rule_hit_superseded" in audit

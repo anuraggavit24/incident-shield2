@@ -11,6 +11,7 @@ import logging
 import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
@@ -26,11 +27,24 @@ from .normalize import (
     normalize_event,
     parse_order_identity,
 )
-from .rules import DEFAULT_CONFIG, LOOKBACK, Hit, RuleTxn, detect_mule_sequence, evaluate
+from .rules import (
+    COUNTABLE_STATUSES,
+    DEFAULT_CONFIG,
+    LOOKBACK,
+    Hit,
+    RecipientHistory,
+    RuleTxn,
+    detect_mule_sequence,
+    evaluate,
+)
 
 log = logging.getLogger("incident_shield.processing")
 
 MAX_ATTEMPTS = 5
+# A failed payer lookup is retried this many times (one sweep apart) before the payment is
+# processed with an unknown payer. A brief PayPal API outage must not turn repeat buyers into
+# a false "burst of new senders".
+IDENTITY_RETRY_ATTEMPTS = 3
 SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3}
 OrderLookup = Callable[[str], dict[str, Any]]
 
@@ -48,14 +62,23 @@ def _max_severity(*levels: str) -> str:
 # --------------------------------------------------------------------------- transactions
 
 
-def _with_identity(txn: NormalizedTxn, lookup: OrderLookup | None) -> tuple[NormalizedTxn, list[str]]:
-    """Captures carry no payer data, so look up the order. A failed lookup leaves identity unknown."""
+class RetryLater(RuntimeError):
+    """Processing should be retried on a later sweep."""
+
+
+def _with_identity(
+    txn: NormalizedTxn, lookup: OrderLookup | None, attempts_so_far: int
+) -> tuple[NormalizedTxn, list[str]]:
+    """Captures carry no payer data, so look up the order. A failed lookup is retried on later
+    sweeps; only after IDENTITY_RETRY_ATTEMPTS does the payment go ahead with an unknown payer."""
     if txn.kind != "capture" or not txn.order_id or lookup is None:
         return txn, []
     try:
         identity = parse_order_identity(lookup(txn.order_id))
-    except Exception as exc:  # noqa: BLE001 - identity is best effort; detection must go on
+    except Exception as exc:  # noqa: BLE001 - recorded and retried
         log.warning("order lookup failed for %s: %r", txn.order_id, exc)
+        if attempts_so_far + 1 < IDENTITY_RETRY_ATTEMPTS:
+            raise RetryLater(f"payer lookup failed, will retry: {exc!r}") from exc
         return txn, ["identity_lookup_failed"]
     if identity is None:
         return txn, ["identity_not_found"]
@@ -123,6 +146,7 @@ def _to_rule_txn(row: Transaction) -> RuleTxn:
     return RuleTxn(
         paypal_id=row.paypal_id,
         direction=row.direction,
+        amount=row.amount,
         amount_usd=row.amount_usd,
         currency=row.currency,
         counterparty_key=row.counterparty_key,
@@ -157,11 +181,21 @@ def run_rules(session: Session, as_of: datetime) -> list[RuleHit]:
             .distinct()
         ).all()
     )
+    known_recipients = {
+        key: RecipientHistory(payouts=int(count), total_usd=Decimal(total or 0))
+        for key, count, total in session.execute(
+            select(Transaction.counterparty_key, func.count(Transaction.id), func.sum(func.abs(Transaction.amount_usd)))
+            .where(Transaction.direction == "out", Transaction.occurred_at < window_start)
+            .where(Transaction.counterparty_key.is_not(None), Transaction.status.in_(COUNTABLE_STATUSES))
+            .group_by(Transaction.counterparty_key)
+        ).all()
+    }
     prior_count = session.scalar(
         select(func.count(Transaction.id)).where(Transaction.occurred_at < as_of - DEFAULT_CONFIG.burst_window)
     )
     new_rows: list[RuleHit] = []
-    for hit in evaluate(as_of, [_to_rule_txn(r) for r in recent], known, int(prior_count or 0)):
+    rule_txns = [_to_rule_txn(r) for r in recent]
+    for hit in evaluate(as_of, rule_txns, known, int(prior_count or 0), known_recipients=known_recipients):
         if session.scalar(select(RuleHit.id).where(RuleHit.dedupe_key == hit.dedupe_key)) is not None:
             continue
         row = RuleHit(
@@ -200,9 +234,11 @@ def _supersede_subsets(session: Session, new: RuleHit) -> None:
             continue
         if old.incident_id is not None:
             incident = session.get(Incident, old.incident_id)
-            if incident is not None and incident.kind == "money_mule_pattern":
-                continue
             if incident is not None:
+                if incident.kind == "money_mule_pattern":
+                    # The bigger hit takes the old one's place in the sequence, so the incident never
+                    # counts the same burst twice. The audit log keeps both IDs.
+                    new.incident_id = incident.id
                 _log(session, incident, "rule_hit_superseded", {"rule_hit_id": old.id, "superseded_by": new.id})
         old.superseded_by = new.id
     session.flush()
@@ -228,8 +264,15 @@ def _get_or_create_incident(session: Session, dedupe_key: str, kind: str, severi
 
 
 def attach_hits(session: Session, new_hits: list[RuleHit], as_of: datetime) -> None:
-    """Group new hits into an indicator incident for the day, then look for the mule sequence."""
+    """Group medium/high hits into an indicator incident for the day, then look for the mule sequence.
+
+    Low-severity hits are stored (GET /rule-hits) but don't open an incident on their own: a small
+    sale or a few new customers is normal business. They still count toward the mule sequence."""
     for hit in new_hits:
+        if hit.incident_id is not None or hit.superseded_by is not None:
+            continue
+        if SEVERITY_ORDER[hit.severity] < SEVERITY_ORDER["medium"]:
+            continue
         day_key = f"indicators:{hit.window_end.astimezone(timezone.utc).date().isoformat()}"
         incident = _get_or_create_incident(session, day_key, "risk_indicators", hit.severity, as_of)
         hit.incident_id = incident.id
@@ -248,7 +291,9 @@ def attach_hits(session: Session, new_hits: list[RuleHit], as_of: datetime) -> N
     match = detect_mule_sequence([_to_hit(r) for r in candidates])
     if match is None:
         return
-    mule = _get_or_create_incident(session, f"mule:{match.probe.dedupe_key}", "money_mule_pattern", "high", as_of)
+    # Without enough history, "new sender" may include regular customers: say so in the severity.
+    severity = "high" if match.burst.values.get("history") == "ok" else "medium"
+    mule = _get_or_create_incident(session, f"mule:{match.probe.dedupe_key}", "money_mule_pattern", severity, as_of)
     for step, hit in (("probe", match.probe), ("burst", match.burst), ("passthrough", match.passthrough)):
         row = by_key[hit.dedupe_key]
         if row.incident_id == mule.id:
@@ -263,14 +308,31 @@ def attach_hits(session: Session, new_hits: list[RuleHit], as_of: datetime) -> N
 # --------------------------------------------------------------------------- event processing
 
 
+def evaluation_times(session: Session, txn: Transaction) -> list[datetime]:
+    """The new transaction's own time, plus every stored transaction time within LOOKBACK after it.
+
+    Webhooks can arrive late (PayPal retries for days). A late payment can complete a pattern that
+    was evaluated earlier without it, so every later evaluation point it falls into is re-run.
+    """
+    later = session.scalars(
+        select(Transaction.occurred_at)
+        .where(Transaction.occurred_at > txn.occurred_at, Transaction.occurred_at <= txn.occurred_at + LOOKBACK)
+        .distinct()
+    ).all()
+    return sorted({txn.occurred_at, *later})
+
+
 def process_event(session: Session, event: WebhookEvent, lookup: OrderLookup | None) -> str:
     normalized = normalize_event(event.payload)
     if normalized is None:
         return "ignored"
-    normalized, flags = _with_identity(normalized, lookup)
+    normalized, flags = _with_identity(normalized, lookup, event.attempts)
     txn = upsert_transaction(session, normalized, event.event_created_at, flags)
-    hits = run_rules(session, txn.occurred_at)
-    attach_hits(session, hits, txn.occurred_at)
+    times = evaluation_times(session, txn)
+    hits: list[RuleHit] = []
+    for as_of in times:
+        hits.extend(run_rules(session, as_of))
+    attach_hits(session, hits, times[-1])
     return "processed"
 
 
@@ -302,7 +364,7 @@ def process_pending(lookup: OrderLookup | None, limit: int = 50) -> int:
                     event.processed_at = _utcnow()
                     event.last_error = None
                 done += 1
-            except (NormalizationError, Exception) as exc:  # noqa: BLE001 - recorded, retried later
+            except (RetryLater, NormalizationError, Exception) as exc:  # noqa: BLE001 - recorded, retried later
                 log.exception("processing failed for webhook event %s", event_id)
                 with db.session_scope() as session:
                     event = session.get(WebhookEvent, event_id)

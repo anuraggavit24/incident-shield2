@@ -9,7 +9,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, false, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -115,9 +115,11 @@ class CopilotCall(Base):
     __tablename__ = "copilot_calls"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    cache_key: Mapped[str] = mapped_column(String(64), unique=True)
+    cache_key: Mapped[str] = mapped_column(String(64), index=True)
     incident_id: Mapped[int] = mapped_column(ForeignKey("incidents.id"), index=True)
     scope: Mapped[str] = mapped_column(String(16))  # owner | judge | warmup
+    # Only stable outcomes are served from cache; failures are kept for the budget and the audit.
+    cacheable: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     source: Mapped[str] = mapped_column(String(16))  # ai | template | refused
     intent: Mapped[str] = mapped_column(String(32))
     response: Mapped[dict[str, Any]] = mapped_column(JSON)

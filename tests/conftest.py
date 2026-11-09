@@ -33,3 +33,4 @@ os.environ["DATABASE_URL"] = os.environ.get(
 )
 os.environ.setdefault("OWNER_API_KEY_SHA256", hashlib.sha256(TEST_OWNER_KEY.encode()).hexdigest())
 os.environ.setdefault("PROCESS_INTERVAL_S", "3600")  # tests drive processing explicitly
+os.environ.setdefault("PAYPAL_MERCHANT_ID", "HUU66NVJRLZ2L")  # the sandbox merchant in the fixtures

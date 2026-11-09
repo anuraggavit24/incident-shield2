@@ -5,15 +5,26 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from app.rules import RuleTxn, detect_mule_sequence, evaluate
+from app.rules import RecipientHistory, RuleTxn, detect_mule_sequence, evaluate
 
 T0 = datetime(2026, 11, 8, 10, 0, tzinfo=timezone.utc)
 
 
-def tx(pid, minutes, direction="in", usd="50.00", currency="USD", sender=None, status="COMPLETED", strength="weak"):
+def tx(
+    pid,
+    minutes,
+    direction="in",
+    usd="50.00",
+    currency="USD",
+    sender=None,
+    status="COMPLETED",
+    strength="weak",
+    amount=None,
+):
     return RuleTxn(
         paypal_id=pid,
         direction=direction,
+        amount=Decimal(amount if amount is not None else (usd or "0")),
         amount_usd=Decimal(usd) if usd is not None else None,
         currency=currency,
         counterparty_key=sender,
@@ -125,3 +136,96 @@ def test_hits_are_deterministic_and_deduplicable() -> None:
     a = evaluate(T0 + timedelta(minutes=9), attack(), set(), 40)
     b = evaluate(T0 + timedelta(minutes=9), attack(), set(), 40)
     assert [h.dedupe_key for h in a] == [h.dedupe_key for h in b]
+
+
+# --------------------------------------------------------------------------- review findings
+
+
+def ordinary_seller(payout_usd="61.00", supplier="payout:supplier@example.com"):
+    """A $0.50 sale from a new customer, three new customers at $40, then a payout to a supplier."""
+    return [
+        tx("s0", 0, usd="0.50", sender="card:new0"),
+        tx("s1", 5, usd="40.00", sender="card:new1"),
+        tx("s2", 10, usd="40.00", sender="card:new2"),
+        tx("s3", 15, usd="40.00", sender="card:new3"),
+        tx("pay", 20, direction="out", usd=payout_usd, sender=supplier, strength="strong"),
+    ]
+
+
+def hits_over_time(txns, known_recipients, known=frozenset(), prior=40):
+    hits = []
+    for t in txns:
+        hits += evaluate(
+            t.occurred_at,
+            [r for r in txns if r.occurred_at <= t.occurred_at],
+            set(known),
+            prior,
+            known_recipients=dict(known_recipients),
+        )
+    return hits
+
+
+SUPPLIER = "payout:supplier@example.com"
+REGULAR_SUPPLIER = {SUPPLIER: RecipientHistory(payouts=3, total_usd=Decimal("200.00"))}
+
+
+def test_ordinary_seller_paying_a_known_supplier_is_not_a_mule_pattern() -> None:
+    hits = hits_over_time(ordinary_seller(payout_usd="110.00"), known_recipients=REGULAR_SUPPLIER)
+    assert "R2_PASS_THROUGH" not in rule_ids(hits)
+    assert detect_mule_sequence(hits) is None
+
+
+def test_draining_payout_to_a_new_recipient_does_count() -> None:
+    hits = hits_over_time(ordinary_seller(payout_usd="110.00"), known_recipients={})
+    assert "R2_PASS_THROUGH" in rule_ids(hits)
+    r2 = next(h for h in hits if h.rule_id == "R2_PASS_THROUGH")
+    assert r2.values["outflow_to_unestablished_recipients_usd"] == "110.00"
+    assert detect_mule_sequence(hits) is not None
+
+
+def test_new_supplier_paid_half_of_the_takings_is_not_pass_through() -> None:
+    # Review round 2: $61 out of $120.50 (51%) to a brand-new supplier. Below the 80% bar.
+    hits = hits_over_time(ordinary_seller(payout_usd="61.00"), known_recipients={})
+    assert "R2_PASS_THROUGH" not in rule_ids(hits)
+    assert detect_mule_sequence(hits) is None
+
+
+def test_one_dollar_warmup_payout_does_not_make_a_recipient_established() -> None:
+    # Review round 2 evasion: pay the exchange $1 an hour earlier so it looks "known".
+    warmed = {"payout:exchange": RecipientHistory(payouts=1, total_usd=Decimal("1.00"))}
+    all_hits = []
+    recent = attack()
+    for t in recent:
+        all_hits += evaluate(
+            t.occurred_at, [r for r in recent if r.occurred_at <= t.occurred_at], set(), 40, known_recipients=warmed
+        )
+    assert "R2_PASS_THROUGH" in rule_ids(all_hits)
+    assert detect_mule_sequence(all_hits) is not None
+
+
+def test_two_tiny_warmups_still_do_not_cover_a_large_payout() -> None:
+    warmed = {"payout:exchange": RecipientHistory(payouts=2, total_usd=Decimal("2.00"))}
+    hits = evaluate(T0 + timedelta(minutes=9), attack(), set(), 40, known_recipients=warmed)
+    assert "R2_PASS_THROUGH" in rule_ids(hits)
+
+
+def test_known_recipient_outflows_are_reported_as_excluded() -> None:
+    txns = attack() + [tx("sup", 9, direction="out", usd="20.00", sender="payout:supplier", strength="strong")]
+    history = {"payout:supplier": RecipientHistory(payouts=4, total_usd=Decimal("80.00"))}
+    hits = evaluate(T0 + timedelta(minutes=9), txns, set(), 40, known_recipients=history)
+    r2 = next(h for h in hits if h.rule_id == "R2_PASS_THROUGH")
+    assert r2.values["outflows_to_established_recipients_excluded"] == 1
+    assert r2.values["outflow_to_unestablished_recipients_usd"] == "250.00"
+
+
+def test_eur_probe_without_usd_value_still_counts() -> None:
+    probe = tx("eurprobe", 0, usd=None, amount="0.79", currency="EUR", sender="card:z")
+    hits = evaluate(T0 + timedelta(minutes=1), [probe], set(), 40)
+    r3 = next(h for h in hits if h.rule_id == "R3_PROBE_PAYMENT")
+    assert r3.values["threshold_basis"] == "original_currency_EUR"
+
+
+def test_small_amount_in_low_value_currency_is_not_called_a_probe() -> None:
+    # 0.79 JPY has no safe unit comparison and no USD value: not evaluated rather than guessed.
+    probe = tx("jpy", 0, usd=None, amount="0.79", currency="JPY", sender="card:z")
+    assert "R3_PROBE_PAYMENT" not in rule_ids(evaluate(T0 + timedelta(minutes=1), [probe], set(), 40))

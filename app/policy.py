@@ -35,6 +35,8 @@ class PolicySection:
             "source": self.source,
             "captured_at": captured_at,
             "sha256": self.sha256,
+            "integrity_note": "The hash shows this text hasn't been edited since capture. It doesn't prove the "
+            "text came from PayPal: check source_url.",
         }
 
 
