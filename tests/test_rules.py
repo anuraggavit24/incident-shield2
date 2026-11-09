@@ -256,3 +256,21 @@ def test_partial_sequence_finds_probe_then_burst_when_the_drain_stays_under_the_
 def test_no_partial_sequence_for_a_busy_hour_without_a_probe() -> None:
     txns = [tx(f"s{i}", i * 5, usd="40.00", sender=f"card:new{i}") for i in range(4)]
     assert detect_partial_sequence(collect(txns)) is None
+
+
+def test_pocket_change_moving_out_is_not_pass_through() -> None:
+    """Review round 5: a $0.40 payout after a $0.50 sale is not worth a review."""
+    txns = [
+        tx("sale", 0, usd="0.50", sender="card:new"),
+        tx("out", 2, direction="out", usd="0.40", sender="payout:someone", strength="strong"),
+    ]
+    assert "R2_PASS_THROUGH" not in rule_ids(collect(txns))
+    assert detect_partial_sequence(collect(txns)) is None
+
+
+def test_five_dollars_out_is_still_counted() -> None:
+    txns = [
+        tx("sale", 0, usd="6.00", sender="card:new"),
+        tx("out", 2, direction="out", usd="5.00", sender="payout:someone", strength="strong"),
+    ]
+    assert "R2_PASS_THROUGH" in rule_ids(collect(txns))

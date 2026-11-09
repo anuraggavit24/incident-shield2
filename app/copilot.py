@@ -30,7 +30,7 @@ from .models import CopilotCall
 from .policy import snapshot
 from .rules import DEFAULT_CONFIG
 
-PROMPT_VERSION = "copilot-v1"
+PROMPT_VERSION = "copilot-v2"  # v2: incident kind explained to the model (partial_pattern)
 MAX_INTERPRETATION_CHARS = 800
 MAX_QUESTION_CHARS = 500
 
@@ -66,6 +66,16 @@ RULE_EXPLANATIONS = {
         "within an hour."
     ),
 }
+
+# What each incident kind means, given to the model with the facts so it can't overstate a partial match.
+KIND_MEANING = {
+    "money_mule_pattern": "All three steps matched in order: a tiny probe payment, then a burst of payments from "
+    "new senders, then most of that money moved out. Still a risk pattern, not proof.",
+    "partial_pattern": "Only TWO of the three steps (tiny probe payment, burst from new senders, money moved out) "
+    "matched in order. Low severity, needs review. Ordinary sales can produce this. Do not describe it as the full "
+    "pattern, and do not mention a step whose rule hit is not listed.",
+}
+
 
 # Sources shown per intent, fixed in code. The model never chooses them.
 POLICY_FOR_INTENT: dict[str, dict[str, list[str]]] = {
@@ -212,7 +222,8 @@ Rules you must follow:
 3. You cannot take any action. Never say you have done, will do, or can do anything on PayPal.
 4. Never state that fraud is confirmed. Rule hits are risk indicators, not proof.
 5. Don't quote or invent PayPal policy; policy text is shown separately by the application.
-6. Keep the interpretation under 120 words.
+6. Describe the incident only as strongly as incident_kind_meaning allows.
+7. Keep the interpretation under 120 words.
 
 Classify the question into exactly one intent: why_flagged, what_first, evidence, rule_meaning, is_confirmed, or out_of_scope (anything not about this incident). If an intent is already given, use it.
 Return rule_hit_ids for the rule hits your interpretation relies on (only ids present in the facts)."""
@@ -366,6 +377,7 @@ def build_facts(record: dict[str, Any]) -> Facts:
     for_model = {
         "incident_id": record["id"],
         "incident_kind": record["kind"],
+        "incident_kind_meaning": KIND_MEANING.get(record["kind"], ""),
         "severity": record["severity"],
         "rule_hits": hits,
         "transactions": txns,

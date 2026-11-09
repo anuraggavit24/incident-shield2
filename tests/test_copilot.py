@@ -463,3 +463,12 @@ def test_gemini_request_has_no_sampling_params_and_room_for_thinking() -> None:
     assert "temperature" not in config and "topP" not in config and "topK" not in config
     assert config["thinkingConfig"] == {"thinkingLevel": "low"}
     assert config["maxOutputTokens"] >= 2048
+
+
+def test_model_is_told_what_a_partial_pattern_means() -> None:
+    from app.copilot import KIND_MEANING, _user_prompt
+
+    record = {"id": 3, "kind": "partial_pattern", "severity": "low", "transactions": [], "rule_hits": []}
+    facts = build_facts(record)
+    assert facts.for_model["incident_kind_meaning"] == KIND_MEANING["partial_pattern"]
+    assert "TWO of the three" in _user_prompt(facts, "why_flagged", None)

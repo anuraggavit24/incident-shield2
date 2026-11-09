@@ -29,6 +29,8 @@ class RuleConfig:
     passthrough_window: timedelta = timedelta(minutes=60)
     # Mules move out most of what arrives; a shop paying a supplier usually doesn't.
     passthrough_min_ratio: Decimal = Decimal("0.8")
+    # Pocket change moving out (e.g. $0.40 after a $0.50 sale) isn't worth a review.
+    passthrough_min_usd: Decimal = Decimal("5.00")
     # A recipient is "established" only with at least this many earlier payouts, together worth at
     # least this share of the new payout, so one tiny warm-up payment isn't enough.
     # This is NOT attacker-proof: paying your own cash-out account first costs nothing (see README).
@@ -174,11 +176,11 @@ def r2_pass_through(
         return None
     total_in, _ = _sum_usd(new_in)
     total_out, _ = _sum_usd(outs)
-    if total_in <= 0 or total_out < total_in * cfg.passthrough_min_ratio:
+    if total_in <= 0 or total_out < cfg.passthrough_min_usd or total_out < total_in * cfg.passthrough_min_ratio:
         return None
     return Hit(
         rule_id="R2_PASS_THROUGH",
-        rule_version=2,  # v2: 80% ratio + established recipients (review round 2)
+        rule_version=3,  # v2: 80% ratio + established recipients; v3: at least $5 out
         severity="low",
         window_start=start,
         window_end=as_of,
