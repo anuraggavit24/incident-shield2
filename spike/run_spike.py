@@ -178,26 +178,45 @@ def cmd_webhooks_list(settings: Settings, args: argparse.Namespace) -> None:
         print(f"  {hook.get('id')}  {hook.get('url')}  events={len(hook.get('event_types', []))}")
 
 
+_WEBHOOK_URL = re.compile(r"^https://[A-Za-z0-9.-]+(:\d+)?/[A-Za-z0-9/_.-]*$")
+
+
+def valid_webhook_url(url: str) -> bool:
+    """Catch typos and unfilled placeholders like https://<new-tunnel>.trycloudflare.com before calling PayPal."""
+    return bool(_WEBHOOK_URL.fullmatch(url)) and "." in (urlparse(url).hostname or "")
+
+
 def cmd_webhook_register(settings: Settings, args: argparse.Namespace) -> None:
-    if not args.url.startswith("https://"):
-        raise ConfigError("PayPal only delivers webhooks to https URLs")
+    if not valid_webhook_url(args.url):
+        raise ConfigError(
+            f"Not a usable webhook URL: {args.url!r}. Copy the real https://...trycloudflare.com address."
+        )
     client = client_for(settings, "merchant")
+    existing = []
     if args.replace:
         listing = safe_json(client.request("GET", "/v1/notifications/webhooks"))
-        for hook in listing.get("webhooks", []) if isinstance(listing, dict) else []:
-            response = client.request("DELETE", f"/v1/notifications/webhooks/{hook['id']}")
-            print(f"deleted {hook['id']} ({hook.get('url')}): HTTP {response.status_code}")
+        existing = listing.get("webhooks", []) if isinstance(listing, dict) else []
+    # Create FIRST. Old webhooks are deleted only after the new one exists, so a failed
+    # registration never leaves the app with no webhook at all.
     body = show(
         client.request(
             "POST", "/v1/notifications/webhooks", json_body={"url": args.url, "event_types": [{"name": "*"}]}
         )
     )
     webhook_id = body.get("id") if isinstance(body, dict) else None
-    if webhook_id:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        WEBHOOK_ID_FILE.write_text(webhook_id, encoding="utf-8")
-        print(f"\nRegistered webhook {webhook_id}. The receiver picks it up automatically (no restart needed).")
-        finding("webhook_registered", webhook_id=webhook_id, url=args.url)
+    if not webhook_id:
+        print("\nRegistration failed: existing webhooks were left untouched.")
+        return
+    for hook in existing:
+        if hook.get("id") != webhook_id:
+            response = client.request("DELETE", f"/v1/notifications/webhooks/{hook['id']}")
+            print(f"deleted old {hook['id']} ({hook.get('url')}): HTTP {response.status_code}")
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    WEBHOOK_ID_FILE.write_text(webhook_id, encoding="utf-8")
+    print(f"\nRegistered webhook {webhook_id}.")
+    print(f"For the app, put this in .env:  PAYPAL_WEBHOOK_ID={webhook_id}")
+    print("Wait ~5 minutes before sending payments (a new webhook missed early events in the spike).")
+    finding("webhook_registered", webhook_id=webhook_id, url=args.url)
 
 
 def cmd_webhook_events(settings: Settings, args: argparse.Namespace) -> None:

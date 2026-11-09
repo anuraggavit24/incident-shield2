@@ -11,20 +11,26 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from . import db
 from .config import get_settings, hash_api_key
-from .models import Incident, IncidentEvent, RuleHit, Transaction, WebhookEvent
+from .copilot import INTENTS, GeminiLLM
+from .copilot import answer as copilot_answer
+from .models import Incident, Transaction, WebhookEvent
 from .normalize import parse_time
 from .paypal_client import PayPalClient, PayPalError
+from .policy import snapshot
 from .processing import process_pending
+from .views import incident_record, txn_out
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("incident_shield")
@@ -48,8 +54,10 @@ async def read_capped(request: Request, limit: int) -> bytes:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
+    snapshot()  # fail at startup if the policy snapshot was tampered with
     db.init_engine(settings.database_url)
     app.state.paypal = PayPalClient(settings)
+    app.state.llm = GeminiLLM(settings.gemini_api_key, settings.gemini_model) if settings.gemini_api_key else None
     app.state.sweeper = asyncio.create_task(_sweep_forever(app, settings.process_interval_s))
     try:
         yield
@@ -71,10 +79,18 @@ async def _sweep_forever(app: FastAPI, interval: float) -> None:
 app = FastAPI(title="Incident Shield", version="0.1.0", lifespan=lifespan)
 
 
-def require_owner(x_api_key: str = Header(default="")) -> None:
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="Owner API key (not the hash)")
+
+
+def require_owner(x_api_key: str | None = Security(api_key_header)) -> None:
     expected = get_settings().owner_api_key_sha256
     if not x_api_key or not hmac.compare_digest(hash_api_key(x_api_key), expected):
         raise HTTPException(status_code=401, detail="invalid API key")
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    return RedirectResponse("/docs")
 
 
 # --------------------------------------------------------------------------- health
@@ -155,30 +171,11 @@ async def paypal_webhook(request: Request, background: BackgroundTasks) -> JSONR
 # --------------------------------------------------------------------------- read API (owner)
 
 
-def _txn_out(t: Transaction) -> dict[str, Any]:
-    return {
-        "paypal_id": t.paypal_id,
-        "kind": t.kind,
-        "direction": t.direction,
-        "amount": str(t.amount),
-        "currency": t.currency,
-        "amount_usd": str(t.amount_usd) if t.amount_usd is not None else None,
-        "status": t.status,
-        "occurred_at": t.occurred_at.isoformat(),
-        "counterparty": t.counterparty_label,
-        "identity_strength": t.identity_strength,
-        "custom_id": t.custom_id,
-        "flags": t.flags,
-        # Attacker-controllable: labelled so no consumer mistakes it for trusted data.
-        "untrusted_text": t.untrusted_text,
-    }
-
-
 @app.get("/transactions", dependencies=[Depends(require_owner)])
 def list_transactions(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
     with db.session_scope() as session:
         rows = session.scalars(select(Transaction).order_by(Transaction.occurred_at.desc()).limit(limit)).all()
-        return [_txn_out(t) for t in rows]
+        return [txn_out(t) for t in rows]
 
 
 @app.get("/incidents", dependencies=[Depends(require_owner)])
@@ -201,39 +198,42 @@ def list_incidents() -> list[dict[str, Any]]:
 @app.get("/incidents/{incident_id}", dependencies=[Depends(require_owner)])
 def get_incident(incident_id: int) -> dict[str, Any]:
     with db.session_scope() as session:
-        incident = session.get(Incident, incident_id)
-        if incident is None:
+        record = incident_record(session, incident_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="incident not found")
+    return record
+
+
+# --------------------------------------------------------------------------- Copilot
+
+
+class AskRequest(BaseModel):
+    intent: Literal["why_flagged", "what_first", "evidence", "rule_meaning", "is_confirmed"] | None = Field(
+        default=None, description="Pick a suggested question. Takes priority over free text."
+    )
+    question: str | None = Field(default=None, max_length=500, description="Free text. Untrusted.")
+
+
+@app.get("/copilot/questions")
+def copilot_questions() -> list[dict[str, str]]:
+    return [{"intent": k, "question": v} for k, v in INTENTS.items()]
+
+
+@app.post("/incidents/{incident_id}/ask", dependencies=[Depends(require_owner)])
+def ask(incident_id: int, body: AskRequest, request: Request) -> dict[str, Any]:
+    if body.intent is None and not (body.question or "").strip():
+        raise HTTPException(status_code=422, detail="give an intent or a question")
+    settings = get_settings()
+    with db.session_scope() as session:
+        record = incident_record(session, incident_id)
+        if record is None:
             raise HTTPException(status_code=404, detail="incident not found")
-        hits = session.scalars(
-            select(RuleHit).where(RuleHit.incident_id == incident_id).order_by(RuleHit.window_end)
-        ).all()
-        txn_ids = sorted({tid for h in hits for tid in h.transaction_ids})
-        txns = session.scalars(select(Transaction).where(Transaction.paypal_id.in_(txn_ids))).all() if txn_ids else []
-        events = session.scalars(
-            select(IncidentEvent).where(IncidentEvent.incident_id == incident_id).order_by(IncidentEvent.id)
-        ).all()
-        return {
-            "id": incident.id,
-            "kind": incident.kind,
-            "severity": incident.severity,
-            "status": incident.status,
-            "opened_at": incident.opened_at.isoformat(),
-            "disclaimer": "Rule hits are risk indicators from Incident Shield's own heuristics, not proof of fraud.",
-            "rule_hits": [
-                {
-                    "id": h.id,
-                    "rule_id": h.rule_id,
-                    "rule_version": h.rule_version,
-                    "severity": h.severity,
-                    "window_start": h.window_start.isoformat(),
-                    "window_end": h.window_end.isoformat(),
-                    "values": h.values,
-                    "transaction_ids": h.transaction_ids,
-                }
-                for h in hits
-            ],
-            "transactions": [_txn_out(t) for t in sorted(txns, key=lambda t: t.occurred_at)],
-            "audit": [
-                {"at": e.at.isoformat(), "actor": e.actor, "action": e.action, "details": e.details} for e in events
-            ],
-        }
+        return copilot_answer(
+            session,
+            record,
+            question=body.question,
+            intent=body.intent,
+            llm=request.app.state.llm,
+            scope="owner",
+            daily_budget=settings.copilot_daily_budget,
+        )

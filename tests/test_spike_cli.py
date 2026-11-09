@@ -269,3 +269,19 @@ def test_reporting_app_used_when_set() -> None:
     client = client_for(settings, "reporting")
     assert client.creds.label == "reporting"
     client.close()
+
+
+@pytest.mark.parametrize(
+    ("url", "ok"),
+    [
+        ("https://nam-witch-approximate-sales.trycloudflare.com/webhooks/paypal", True),
+        ("https://<new-tunnel>.trycloudflare.com/webhooks/paypal", False),
+        ("http://x.trycloudflare.com/webhooks/paypal", False),
+        ("https://localhost/webhooks/paypal", False),
+        ("https://x.trycloudflare.com/webhooks/paypal extra", False),
+    ],
+)
+def test_valid_webhook_url(url: str, ok: bool) -> None:
+    from spike.run_spike import valid_webhook_url
+
+    assert valid_webhook_url(url) is ok

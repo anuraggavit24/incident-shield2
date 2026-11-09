@@ -177,7 +177,35 @@ def run_rules(session: Session, as_of: datetime) -> list[RuleHit]:
         session.add(row)
         new_rows.append(row)
     session.flush()
+    for row in new_rows:
+        _supersede_subsets(session, row)
     return new_rows
+
+
+def _supersede_subsets(session: Session, new: RuleHit) -> None:
+    """A rule re-evaluated on each payment produces growing hits (3 senders, then 4...). The larger
+    hit replaces the smaller ones it fully contains, so the incident shows one hit per burst.
+    Hits already linked into a money-mule incident are never touched (that evidence is fixed)."""
+    new_ids = set(new.transaction_ids)
+    older = session.scalars(
+        select(RuleHit).where(
+            RuleHit.rule_id == new.rule_id,
+            RuleHit.id != new.id,
+            RuleHit.superseded_by.is_(None),
+            RuleHit.window_end >= new.window_start,
+        )
+    ).all()
+    for old in older:
+        if not set(old.transaction_ids) < new_ids:
+            continue
+        if old.incident_id is not None:
+            incident = session.get(Incident, old.incident_id)
+            if incident is not None and incident.kind == "money_mule_pattern":
+                continue
+            if incident is not None:
+                _log(session, incident, "rule_hit_superseded", {"rule_hit_id": old.id, "superseded_by": new.id})
+        old.superseded_by = new.id
+    session.flush()
 
 
 # --------------------------------------------------------------------------- incidents
@@ -212,7 +240,9 @@ def attach_hits(session: Session, new_hits: list[RuleHit], as_of: datetime) -> N
     session.flush()
 
     candidates = session.scalars(
-        select(RuleHit).where(RuleHit.window_end >= as_of - 3 * DEFAULT_CONFIG.sequence_max_gap)
+        select(RuleHit).where(
+            RuleHit.window_end >= as_of - 3 * DEFAULT_CONFIG.sequence_max_gap, RuleHit.superseded_by.is_(None)
+        )
     ).all()
     by_key = {row.dedupe_key: row for row in candidates}
     match = detect_mule_sequence([_to_hit(r) for r in candidates])

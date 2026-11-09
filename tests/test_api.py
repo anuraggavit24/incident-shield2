@@ -35,7 +35,10 @@ def client(monkeypatch):
     with TestClient(app) as c:
         with db.get_engine().begin() as conn:
             conn.execute(
-                text("TRUNCATE incident_events, rule_hits, incidents, transactions, webhook_events RESTART IDENTITY")
+                text(
+                    "TRUNCATE copilot_calls, incident_events, rule_hits, incidents, "
+                    "transactions, webhook_events RESTART IDENTITY"
+                )
             )
         state = {"verify": "SUCCESS"}
 

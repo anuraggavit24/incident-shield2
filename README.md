@@ -17,7 +17,12 @@ Built for the PayPal AI Hackathon (Devpost). **Sandbox only, by design:** the ap
    - R4 inflows in 3+ original currencies
    These are Incident Shield's own heuristics. PayPal publishes trigger categories, not thresholds. A hit is a risk indicator, not proof of fraud.
 4. **Sequence detector:** probe → burst → money out within an hour = `money_mule_pattern` incident, high severity.
-5. **Incidents** with an append-only audit log. Payer-typed text (names) is stored as `untrusted_text` and never interpreted.
+5. **Incidents** with an append-only audit log. Payer-typed text (names) is stored as `untrusted_text` and never interpreted. When a rule re-fires on a growing burst, the larger hit replaces the smaller one.
+6. **Copilot** (`POST /incidents/{id}/ask`): grounded Q&A over one incident. Every answer separates five parts:
+   - **observed** (payments, from the record), **calculated** (rule values), **PayPal docs say** (hashed excerpts of PayPal help pages, fixed per question in code), **recommended** (fixed steps, each with its source), **unknown**
+   - plus one **AI interpretation**, the only text the model writes. It's rejected if it mentions any number, date, time, ID or currency not in the record, or a verdict like "is safe" / "confirmed fraud".
+   - Questions map to five fixed intents; anything else is refused. Payer-typed text reaches the model only inside an `<untrusted_data>` block, and the model has no tools.
+   - Without an API key, over the daily budget, or on any AI failure, deterministic template answers take over. Answers are cached by question + evidence.
 
 ## Measured in the PayPal sandbox (see SPIKE.md)
 
@@ -39,7 +44,7 @@ uvicorn app.main:app --port 8000
 
 `.env` needs `MERCHANT_CLIENT_ID`, `MERCHANT_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`, `DATABASE_URL`, `OWNER_API_KEY_SHA256` (see `.env.example`).
 
-API: `GET /health/live`, `GET /health/ready`, `POST /webhooks/paypal`, and with header `X-API-Key`: `GET /transactions`, `GET /incidents`, `GET /incidents/{id}`. Interactive docs at `/docs`.
+API: `GET /health/live`, `GET /health/ready`, `POST /webhooks/paypal`, `GET /copilot/questions`, and with header `X-API-Key` (use **Authorize** in `/docs`): `GET /transactions`, `GET /incidents`, `GET /incidents/{id}`, `POST /incidents/{id}/ask`. Interactive docs at `/docs`.
 
 ## Tests
 

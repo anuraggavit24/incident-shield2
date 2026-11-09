@@ -90,6 +90,8 @@ class RuleHit(Base):
     transaction_ids: Mapped[list[str]] = mapped_column(JSON)
     dedupe_key: Mapped[str] = mapped_column(String(64), unique=True)
     incident_id: Mapped[int | None] = mapped_column(ForeignKey("incidents.id"), index=True)
+    # Set when a later hit of the same rule covers all of this hit's transactions.
+    superseded_by: Mapped[int | None] = mapped_column(ForeignKey("rule_hits.id"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -104,3 +106,19 @@ class IncidentEvent(Base):
     actor: Mapped[str] = mapped_column(String(16))  # system | owner
     action: Mapped[str] = mapped_column(String(48))
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class CopilotCall(Base):
+    """Every Copilot answer: the cache (same question + same evidence = same answer, no new AI call)
+    and the persistent daily AI budget (it survives restarts)."""
+
+    __tablename__ = "copilot_calls"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cache_key: Mapped[str] = mapped_column(String(64), unique=True)
+    incident_id: Mapped[int] = mapped_column(ForeignKey("incidents.id"), index=True)
+    scope: Mapped[str] = mapped_column(String(16))  # owner | judge | warmup
+    source: Mapped[str] = mapped_column(String(16))  # ai | template | refused
+    intent: Mapped[str] = mapped_column(String(32))
+    response: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
