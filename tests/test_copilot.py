@@ -501,3 +501,91 @@ def test_gemini_errors_show_googles_reason_code() -> None:
     llm = GeminiLLM("k", "m", transport=httpx.MockTransport(lambda r: httpx.Response(401, json=body)))
     with pytest.raises(LLMError, match="401 \\(UNAUTHENTICATED / ACCESS_TOKEN_TYPE_UNSUPPORTED\\)"):
         llm.generate("s", "u", {})
+
+
+def _gemini_ok(text: str = '{"ok": true}') -> dict:
+    return {"candidates": [{"content": {"parts": [{"text": text}]}}]}
+
+
+def test_overloaded_main_model_falls_back_once() -> None:
+    import httpx
+
+    from app.copilot import GeminiLLM
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path.split("/")[-1])
+        if "main-model" in request.url.path:
+            return httpx.Response(503, json={"error": {"status": "UNAVAILABLE"}})
+        return httpx.Response(200, json=_gemini_ok())
+
+    llm = GeminiLLM("k", "main-model", "backup-model", transport=httpx.MockTransport(handler))
+    assert llm.generate("s", "u", {}) == {"ok": True}
+    assert llm.last_model == "backup-model"
+    assert seen == ["main-model:generateContent", "backup-model:generateContent"]
+
+
+def test_bad_key_does_not_fall_back() -> None:
+    import httpx
+
+    from app.copilot import GeminiLLM, LLMError
+
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(1)
+        return httpx.Response(401, json={"error": {"status": "UNAUTHENTICATED"}})
+
+    llm = GeminiLLM("k", "main-model", "backup-model", transport=httpx.MockTransport(handler))
+    with pytest.raises(LLMError, match="401"):
+        llm.generate("s", "u", {})
+    assert seen == [1] and llm.last_model is None
+
+
+def test_timeout_falls_back_and_both_failures_are_reported() -> None:
+    import httpx
+
+    from app.copilot import GeminiLLM, LLMError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "main-model" in request.url.path:
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(503, json={"error": {"status": "UNAVAILABLE"}})
+
+    llm = GeminiLLM("k", "main-model", "backup-model", transport=httpx.MockTransport(handler))
+    with pytest.raises(LLMError, match="main-model: .*ReadTimeout.*fallback backup-model: Gemini HTTP 503"):
+        llm.generate("s", "u", {})
+
+
+# Sentences from the first real Gemini smoke run (2026-11-09) that were wrongly blocked.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "This incident was flagged due to a potential risk pattern, not confirmed fraud.",
+        "No, it is not confirmed fraud. Rule hits are risk indicators.",
+        "Check whether these payments align with your normal business.",
+        "Ordinary sales activity can also produce this pattern, so it needs review.",
+        "It could be ordinary sales from new customers.",
+    ],
+)
+def test_hedged_or_negated_phrasings_pass(text) -> None:
+    record = {"id": 3, "kind": "partial_pattern", "severity": "low", "transactions": [], "rule_hits": []}
+    assert check_interpretation(text, build_facts(record)) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "This is confirmed fraud.",
+        "Proven money mule activity.",
+        "This is normal business.",
+        "These are ordinary sales. Nothing to see.",
+        "Just regular payments from customers.",
+        "Your account shows confirmed fraud.",
+        "It's normal business, and you can ignore it.",
+    ],
+)
+def test_plain_verdicts_are_still_blocked(text) -> None:
+    record = {"id": 3, "kind": "partial_pattern", "severity": "low", "transactions": [], "rule_hits": []}
+    assert check_interpretation(text, build_facts(record)) != []

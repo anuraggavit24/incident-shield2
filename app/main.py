@@ -119,7 +119,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     snapshot()  # fail at startup if the policy snapshot was tampered with
     db.init_engine(settings.database_url)
     app.state.paypal = PayPalClient(settings)
-    app.state.llm = GeminiLLM(settings.gemini_api_key, settings.gemini_model) if settings.gemini_api_key else None
+    app.state.llm = (
+        GeminiLLM(settings.gemini_api_key, settings.gemini_model, settings.gemini_fallback_model)
+        if settings.gemini_api_key
+        else None
+    )
     app.state.webhook_limiter = RateLimiter(settings.webhook_rate_per_minute)
     app.state.verify_slots = threading.BoundedSemaphore(settings.verify_concurrency)
     app.state.sweeper = asyncio.create_task(_sweep_forever(app, settings.process_interval_s))

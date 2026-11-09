@@ -178,16 +178,51 @@ def _google_reason(response: httpx.Response) -> str:
         return ""
 
 
-class GeminiLLM:
-    """Gemini via REST with a JSON response schema. No tools are ever passed."""
+class TransientLLMError(LLMError):
+    """Overloaded, rate-limited or slow: worth one try on the fallback model."""
 
-    def __init__(self, api_key: str, model: str, timeout: float = 25.0, transport: httpx.BaseTransport | None = None):
+
+TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
+
+
+class GeminiLLM:
+    """Gemini via REST with a JSON response schema. No tools are ever passed.
+
+    If the main model is overloaded or too slow, the same request is tried once on `fallback_model`.
+    `last_model` says which model actually answered (None if neither did)."""
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        fallback_model: str = "",
+        timeout: float = 20.0,
+        transport: httpx.BaseTransport | None = None,
+    ):
         self.model = model
+        self.fallback_model = fallback_model if fallback_model and fallback_model != model else ""
+        self.last_model: str | None = None
         self._key = api_key
         self._http = httpx.Client(timeout=timeout, transport=transport)
 
     def generate(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+        self.last_model = None
+        try:
+            out = self._call(self.model, system, user, schema)
+            self.last_model = self.model
+            return out
+        except TransientLLMError as first:
+            if not self.fallback_model:
+                raise
+            try:
+                out = self._call(self.fallback_model, system, user, schema)
+            except LLMError as second:
+                raise LLMError(f"{self.model}: {first}; fallback {self.fallback_model}: {second}") from second
+            self.last_model = self.fallback_model
+            return out
+
+    def _call(self, model: str, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         body = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
@@ -203,10 +238,13 @@ class GeminiLLM:
         }
         try:
             response = self._http.post(url, json=body, headers={"x-goog-api-key": self._key})
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise TransientLLMError(f"Gemini request failed: {exc!r}") from exc
         except httpx.HTTPError as exc:
             raise LLMError(f"Gemini request failed: {exc!r}") from exc
         if response.status_code != 200:
-            raise LLMError(f"Gemini HTTP {response.status_code}{_google_reason(response)}")
+            error = TransientLLMError if response.status_code in TRANSIENT_STATUS else LLMError
+            raise error(f"Gemini HTTP {response.status_code}{_google_reason(response)}")
         try:
             text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
             parsed = json.loads(text)
@@ -462,6 +500,33 @@ _FORBIDDEN_PATTERNS = [
 ]
 _FORBIDDEN_VERDICTS = re.compile(r"\b(?:" + "|".join(_FORBIDDEN_PATTERNS) + r")\b", re.IGNORECASE)
 
+# Narrow exemptions, found in real Gemini output where a correct sentence was blocked:
+#   "fraud is NOT confirmed fraud"            -> a negated "confirmed fraud" is the answer we want
+#   "check it matches YOUR normal business"   -> advice about the owner's business, not a verdict
+#   "ordinary sales activity CAN also cause this" -> a hedge the partial-pattern meaning itself states
+# A bare verdict ("This is normal business.", "Confirmed fraud.") is still blocked.
+_CERTAINTY_CLAIM = re.compile(r"(?:confirmed|proven)\s", re.IGNORECASE)
+_NOUN_VERDICT = re.compile(r"(?:normal|ordinary|routine|typical|genuine|legitimate|regular)\s", re.IGNORECASE)
+_NEGATION_BEFORE = re.compile(r"\b(?:not|no|never|than|n't)\s+(?:\w+\s+){0,2}$", re.IGNORECASE)
+_HEDGE = re.compile(r"\b(?:can|could|may|might)\b", re.IGNORECASE)
+
+
+def _exempt(text: str, match: re.Match[str]) -> bool:
+    phrase = match.group(0)
+    before = text[max(0, match.start() - 30) : match.start()]
+    if _CERTAINTY_CLAIM.match(phrase):
+        return bool(_NEGATION_BEFORE.search(before))
+    if _NOUN_VERDICT.match(phrase):
+        if re.search(r"\byour\s+$", before, re.IGNORECASE):
+            return True
+        sentence_start = max(text.rfind(".", 0, match.start()), text.rfind("!", 0, match.start())) + 1
+        sentence_end = min(
+            (i for i in (text.find(".", match.end()), text.find("!", match.end())) if i != -1), default=len(text)
+        )
+        return bool(_HEDGE.search(text[sentence_start:sentence_end]))
+    return False
+
+
 # "<count> <noun>" claims must match the record's count FOR THAT NOUN, not just any number in it.
 _COUNT_CLAIM = re.compile(
     r"\b(\d+|" + "|".join(SPELLED) + r")\s+(?:new\s+|different\s+|distinct\s+|separate\s+|unknown\s+)?"
@@ -499,7 +564,8 @@ def check_interpretation(text: str, facts: Facts) -> list[str]:
     detectable fabrication", not "verified true"."""
     problems: list[str] = []
     for match in _FORBIDDEN_VERDICTS.finditer(text):
-        problems.append(f"forbidden phrase: {match.group(0).strip()}")
+        if not _exempt(text, match):
+            problems.append(f"forbidden phrase: {match.group(0).strip()}")
     for number, noun in _COUNT_CLAIM.findall(text):
         value = Decimal(SPELLED[number.lower()]) if number.lower() in SPELLED else _norm_decimal(number)
         group = _NOUN_GROUP[noun.lower()]
@@ -729,7 +795,7 @@ def answer(
                 **interpretation,
                 "label": "AI interpretation. Generated text that passed automated checks (numbers, dates, times, IDs, "
                 "currencies and counts must match the record; blocked phrases are refused). Its meaning is NOT verified.",
-                "model": model_name,
+                "model": getattr(llm, "last_model", None) or model_name,
                 "prompt_version": PROMPT_VERSION,
             },
             "untrusted_text_seen": facts.untrusted_names,
