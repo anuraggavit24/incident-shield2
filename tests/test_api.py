@@ -130,15 +130,19 @@ def test_incident_detail_shows_evidence_audit_and_labels_untrusted_text(client) 
     assert any(a["action"] == "opened" for a in detail["audit"])
 
 
-def test_low_hits_are_listed_even_without_an_incident(client) -> None:
+def test_real_burst_is_a_needs_review_incident_and_every_hit_is_listed(client) -> None:
     for event in EVENTS:
         post(client, event)
     auth = {"x-api-key": TEST_OWNER_KEY}
-    assert client.get("/incidents", headers=auth).json() == []
+    incidents = client.get("/incidents", headers=auth).json()
+    assert [(i["kind"], i["severity"]) for i in incidents] == [("partial_pattern", "low")]
     hits = client.get("/rule-hits", headers=auth).json()
     assert {"R1_BURST_NEW_SENDERS", "R3_PROBE_PAYMENT", "R4_CURRENCY_MIX"} <= {h["rule_id"] for h in hits}
-    assert all(h["severity"] == "low" and h["incident_id"] is None for h in hits)
+    assert any(h["rule_id"] == "R4_CURRENCY_MIX" and h["incident_id"] is None for h in hits)
     assert client.get("/rule-hits").status_code == 401
+    summary = client.get("/summary", headers=auth).json()
+    assert summary["incidents_by_kind"] == {"partial_pattern": 1}
+    assert "1 pattern(s) need review" in summary["attention"]
 
 
 def test_health(client) -> None:
@@ -194,6 +198,26 @@ def test_capture_without_a_payee_is_quarantined(client) -> None:
     with db.session_scope() as session:
         event = session.scalar(select(WebhookEvent).where(WebhookEvent.event_id == "WH-NOPAYEE-1"))
         assert event.status == "quarantined" and "no payee" in event.last_error
+
+
+def test_quarantined_events_show_up_in_the_summary(client) -> None:
+    bare = copy.deepcopy(next(e for e in EVENTS if e["event_type"] == "PAYMENT.CAPTURE.COMPLETED"))
+    bare["id"] = "WH-NOPAYEE-2"
+    del bare["resource"]["payee"]
+    post(client, bare)
+    summary = client.get("/summary", headers={"x-api-key": TEST_OWNER_KEY}).json()
+    assert summary["webhook_events_by_status"]["quarantined"] == 1
+    assert any("quarantined" in line for line in summary["attention"])
+
+
+def test_refund_without_a_payee_is_not_labelled_quarantined(client) -> None:
+    refund = {
+        "id": "WH-REFUND-1",
+        "event_type": "PAYMENT.CAPTURE.REFUNDED",
+        "create_time": "2026-11-09T07:00:00Z",
+        "resource": {"id": "REF123", "status": "COMPLETED", "amount": {"currency_code": "USD", "value": "5.00"}},
+    }
+    assert post(client, refund).json() == {"outcome": "accepted"}
 
 
 def test_payout_events_without_a_payee_are_not_quarantined(client) -> None:

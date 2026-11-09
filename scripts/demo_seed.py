@@ -1,13 +1,18 @@
 """Seed ONE complete money-mule pattern so you can demo incidents and the Copilot.
 
-Why this exists: the PayPal sandbox cannot produce the probe -> burst -> pass-through sequence in
-real time, and since round 3 a single rule firing never opens an incident. Without this script a
-fresh deployment shows no incidents at all.
+Why this exists: the sandbox CAN run the whole pattern live (real card captures and a real payout;
+see SPIKE.md), but it can't backdate payments. A live run without a history phase more than an hour
+earlier is reported at medium severity, and since round 3 a single rule firing never opens an
+incident, so a fresh deployment shows nothing until someone runs the attack. This gives a ready,
+repeatable incident for judges and for the Copilot. Prefer the live sandbox run for the video.
 
-Usage:   python scripts/demo_seed.py            (needs DATABASE_URL in .env; run `alembic upgrade head` first)
+Usage:   python scripts/demo_seed.py --confirm   (needs DATABASE_URL in .env; run `alembic upgrade head` first)
+         python scripts/demo_seed.py --remove    (deletes the DEMO- data and everything built from it)
 Effect:  inserts clearly-labelled DEMO webhook events (ids start with "DEMO-") and runs the real
          pipeline on them, with card names supplied locally instead of looking them up on PayPal.
-         Safe to run twice: existing DEMO events are skipped. Use it on a demo database only.
+         These events are NOT from PayPal and were never signature-verified. Their fake "regular
+         buyers" also count as history for real events, so use a demo database only.
+         Safe to run twice: existing DEMO events are skipped.
 """
 
 from __future__ import annotations
@@ -21,11 +26,11 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import delete, select, update  # noqa: E402
 
 from app import db  # noqa: E402
 from app.config import normalize_database_url  # noqa: E402
-from app.models import Incident, WebhookEvent  # noqa: E402
+from app.models import CopilotCall, Incident, IncidentEvent, RuleHit, Transaction, WebhookEvent  # noqa: E402
 from app.processing import process_pending  # noqa: E402
 
 PAYERS = {
@@ -120,7 +125,44 @@ def seed(now: datetime | None = None) -> int:
         return incident.id if incident else 0
 
 
+def remove() -> dict[str, int]:
+    """Delete DEMO- events, their transactions, every rule hit that used one of them, and incidents
+    left with demo hits (with their audit log and Copilot answers). Mixed incidents are removed too:
+    any incident that touched demo data is no longer trustworthy evidence."""
+    with db.session_scope() as session:
+        demo_txns = set(session.scalars(select(Transaction.paypal_id).where(Transaction.paypal_id.like("DEMO%"))))
+        hits = [h for h in session.scalars(select(RuleHit)) if demo_txns.intersection(h.transaction_ids or [])]
+        hit_ids = {h.id for h in hits}
+        incident_ids = {h.incident_id for h in hits if h.incident_id is not None}
+        if incident_ids:
+            # Hits from real data in those incidents stay, unlinked (they're still listed at /rule-hits).
+            session.execute(update(RuleHit).where(RuleHit.incident_id.in_(incident_ids)).values(incident_id=None))
+            session.execute(delete(CopilotCall).where(CopilotCall.incident_id.in_(incident_ids)))
+            session.execute(delete(IncidentEvent).where(IncidentEvent.incident_id.in_(incident_ids)))
+        if hit_ids:
+            session.execute(update(RuleHit).where(RuleHit.superseded_by.in_(hit_ids)).values(superseded_by=None))
+            session.execute(delete(RuleHit).where(RuleHit.id.in_(hit_ids)))
+        if incident_ids:
+            session.execute(delete(Incident).where(Incident.id.in_(incident_ids)))
+        txns = session.execute(delete(Transaction).where(Transaction.paypal_id.like("DEMO%"))).rowcount
+        events = session.execute(delete(WebhookEvent).where(WebhookEvent.event_id.like("DEMO-%"))).rowcount
+    return {"events": events, "transactions": txns, "rule_hits": len(hit_ids), "incidents": len(incident_ids)}
+
+
 def main() -> int:
+    if "--remove" in sys.argv[1:]:
+        load_dotenv()
+        url = os.getenv("DATABASE_URL", "").strip()
+        if not url:
+            print("DATABASE_URL is not set (put it in .env).")
+            return 1
+        db.init_engine(normalize_database_url(url))
+        print("Removed:", remove())
+        return 0
+    if "--confirm" not in sys.argv[1:]:
+        print("This writes fake, unverified DEMO- events into DATABASE_URL and they affect real detection.")
+        print("Use a demo database only, then run again with --confirm.")
+        return 2
     load_dotenv()
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:

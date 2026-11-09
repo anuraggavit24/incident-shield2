@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from app.rules import RecipientHistory, RuleTxn, detect_mule_sequence, evaluate
+from app.rules import RecipientHistory, RuleTxn, detect_mule_sequence, detect_partial_sequence, evaluate
 
 T0 = datetime(2026, 11, 8, 10, 0, tzinfo=timezone.utc)
 
@@ -229,3 +229,30 @@ def test_small_amount_in_low_value_currency_is_not_called_a_probe() -> None:
     # 0.79 JPY has no safe unit comparison and no USD value: not evaluated rather than guessed.
     probe = tx("jpy", 0, usd=None, amount="0.79", currency="JPY", sender="card:z")
     assert "R3_PROBE_PAYMENT" not in rule_ids(evaluate(T0 + timedelta(minutes=1), [probe], set(), 40))
+
+
+def collect(txns, **kw):
+    hits = []
+    for t in txns:
+        hits += evaluate(t.occurred_at, [r for r in txns if r.occurred_at <= t.occurred_at], set(), 40, **kw)
+    return hits
+
+
+def test_partial_sequence_finds_burst_then_drain_without_a_probe() -> None:
+    no_probe = [t for t in attack() if t.paypal_id != "aprobe"]
+    hits = collect(no_probe)
+    assert detect_mule_sequence(hits) is None
+    partial = detect_partial_sequence(hits)
+    assert partial is not None and [name for name, _ in partial.steps] == ["burst", "passthrough"]
+
+
+def test_partial_sequence_finds_probe_then_burst_when_the_drain_stays_under_the_bar() -> None:
+    txns = attack()[:-1] + [tx("aout", 9, direction="out", usd="200.00", sender="payout:exchange", strength="strong")]
+    hits = collect(txns)  # 200 / 284.38 = 70%: no R2
+    assert detect_mule_sequence(hits) is None
+    assert [name for name, _ in detect_partial_sequence(hits).steps] == ["probe", "burst"]
+
+
+def test_no_partial_sequence_for_a_busy_hour_without_a_probe() -> None:
+    txns = [tx(f"s{i}", i * 5, usd="40.00", sender=f"card:new{i}") for i in range(4)]
+    assert detect_partial_sequence(collect(txns)) is None

@@ -569,6 +569,12 @@ def template_interpretation(intent: str, record: dict[str, Any]) -> str:
         text = f"Incident Shield's rules matched: {names}."
         if record["kind"] == "money_mule_pattern":
             text += " They happened in the order typical of an account being used to pass money from unknown senders straight through."
+        elif record["kind"] == "partial_pattern":
+            text += (
+                " They match part of the order typical of money passing straight through an account (a tiny payment, "
+                "then payments from new senders, then money moving out), not all of it. That's why it needs review "
+                "rather than being reported as the full pattern."
+            )
         return text
     if intent == "what_first":
         return "Start with the first recommended step. The steps come from PayPal's help pages and Incident Shield's own guidance, not from an AI."

@@ -35,6 +35,7 @@ from .rules import (
     RecipientHistory,
     RuleTxn,
     detect_mule_sequence,
+    detect_partial_sequence,
     evaluate,
 )
 
@@ -235,7 +236,7 @@ def _supersede_subsets(session: Session, new: RuleHit) -> None:
         if old.incident_id is not None:
             incident = session.get(Incident, old.incident_id)
             if incident is not None:
-                if incident.kind == "money_mule_pattern":
+                if incident.kind in PATTERN_KINDS:
                     # The bigger hit takes the old one's place in the sequence, so the incident never
                     # counts the same burst twice. The audit log keeps both IDs.
                     new.incident_id = incident.id
@@ -263,8 +264,13 @@ def _get_or_create_incident(session: Session, dedupe_key: str, kind: str, severi
     return incident
 
 
+PATTERN_KINDS = ("money_mule_pattern", "partial_pattern")
+
+
 def open_sequence_incident(session: Session, as_of: datetime) -> None:
-    """Open an incident only for the full probe -> burst -> out sequence.
+    """Full probe -> burst -> out sequence: `money_mule_pattern` (medium/high).
+    Two of the three steps in order: `partial_pattern`, low severity, "needs review". It's upgraded in
+    place if the missing step shows up later, so one pattern is always one incident.
 
     A single rule firing is stored and listed at GET /rule-hits, but never opens an incident: R1 has
     no per-account baseline, so a busy sales hour from new customers looks exactly like a burst."""
@@ -274,32 +280,41 @@ def open_sequence_incident(session: Session, as_of: datetime) -> None:
         )
     ).all()
     by_key = {row.dedupe_key: row for row in candidates}
-    match = detect_mule_sequence([_to_hit(r) for r in candidates])
-    if match is None:
-        return
-    # Without enough history, "new sender" may include regular customers: say so in the severity.
-    severity = "high" if match.burst.values.get("history") == "ok" else "medium"
-    steps = (("probe", match.probe), ("burst", match.burst), ("passthrough", match.passthrough))
+    hits = [_to_hit(r) for r in candidates]
+    match = detect_mule_sequence(hits)
+    steps: tuple[tuple[str, Hit], ...]
+    if match is not None:
+        kind, prefix = "money_mule_pattern", "mule"
+        # Without enough history, "new sender" may include regular customers: say so in the severity.
+        severity = "high" if match.burst.values.get("history") == "ok" else "medium"
+        steps = (("probe", match.probe), ("burst", match.burst), ("passthrough", match.passthrough))
+    else:
+        partial = detect_partial_sequence(hits)
+        if partial is None:
+            return
+        kind, prefix, severity = "partial_pattern", "partial", "low"
+        steps = partial.steps
     # A late webhook can reveal an EARLIER probe for a pattern that already has an incident. Keying
     # only on the earliest probe would then open a second incident for the same pattern, so reuse
-    # the oldest incident any of the three matched hits is already linked to.
+    # the oldest incident any of the matched hits is already linked to.
     linked_ids = [by_key[h.dedupe_key].incident_id for _, h in steps if by_key[h.dedupe_key].incident_id is not None]
     existing = (
         session.scalar(
             select(Incident)
-            .where(Incident.id.in_(linked_ids), Incident.kind == "money_mule_pattern")
+            .where(Incident.id.in_(linked_ids), Incident.kind.in_(PATTERN_KINDS))
             .order_by(Incident.id)
             .limit(1)
         )
         if linked_ids
         else None
     )
-    mule = existing or _get_or_create_incident(
-        session, f"mule:{match.probe.dedupe_key}", "money_mule_pattern", severity, as_of
-    )
-    if existing is not None and severity == "high" and mule.severity != "high":
-        mule.severity = "high"
-        _log(session, mule, "severity_raised", {"severity": "high"})
+    mule = existing or _get_or_create_incident(session, f"{prefix}:{steps[0][1].dedupe_key}", kind, severity, as_of)
+    if existing is not None and kind == "money_mule_pattern" and mule.kind == "partial_pattern":
+        mule.kind, mule.severity = kind, severity
+        _log(session, mule, "upgraded_to_full_pattern", {"severity": severity})
+    elif existing is not None and SEVERITY_ORDER[severity] > SEVERITY_ORDER[mule.severity]:
+        mule.severity = severity
+        _log(session, mule, "severity_raised", {"severity": severity})
     for step, hit in steps:
         row = by_key[hit.dedupe_key]
         if row.incident_id == mule.id:

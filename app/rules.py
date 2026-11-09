@@ -280,6 +280,43 @@ class SequenceMatch:
     passthrough: Hit
 
 
+@dataclass(frozen=True)
+class PartialMatch:
+    """Two of the three sequence steps, in order: (step name, hit) pairs."""
+
+    steps: tuple[tuple[str, Hit], tuple[str, Hit]]
+
+
+def detect_partial_sequence(hits: list[Hit], cfg: RuleConfig = DEFAULT_CONFIG) -> PartialMatch | None:
+    """Two of probe -> burst -> money out, in order and within the gap (probe -> out may span two gaps,
+    since the burst between them is missing). This is what an evader who stays under one threshold
+    leaves behind, e.g. draining 79% or paying a "warmed-up" recipient. Returns the earliest pair."""
+    by_rule = {
+        name: sorted((h for h in hits if h.rule_id == rule), key=lambda h: h.window_end)
+        for name, rule in (
+            ("probe", "R3_PROBE_PAYMENT"),
+            ("burst", "R1_BURST_NEW_SENDERS"),
+            ("passthrough", "R2_PASS_THROUGH"),
+        )
+    }
+    pairs = (("probe", "burst", 1), ("burst", "passthrough", 1), ("probe", "passthrough", 2))
+    found: list[PartialMatch] = []
+    for first, second, gaps in pairs:
+        for a in by_rule[first]:
+            b = next(
+                (
+                    h
+                    for h in by_rule[second]
+                    if a.window_end <= h.window_end <= a.window_end + gaps * cfg.sequence_max_gap
+                ),
+                None,
+            )
+            if b is not None:
+                found.append(PartialMatch(steps=((first, a), (second, b))))
+                break
+    return min(found, key=lambda m: m.steps[0][1].window_end, default=None)
+
+
 def detect_mule_sequence(hits: list[Hit], cfg: RuleConfig = DEFAULT_CONFIG) -> SequenceMatch | None:
     """Probe payment -> burst from new senders -> money moved out, each step within
     `sequence_max_gap` of the previous one. Returns the earliest complete match."""

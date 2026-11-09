@@ -23,7 +23,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
 from . import db
@@ -31,7 +31,7 @@ from .config import get_settings, hash_api_key
 from .copilot import INTENTS, GeminiLLM
 from .copilot import answer as copilot_answer
 from .models import Incident, RuleHit, Transaction, WebhookEvent
-from .normalize import parse_time
+from .normalize import CAPTURE_EVENTS, parse_time
 from .paypal_client import PayPalClient, PayPalError
 from .policy import snapshot
 from .processing import process_pending
@@ -225,12 +225,13 @@ async def paypal_webhook(request: Request, background: BackgroundTasks) -> JSONR
     expected_merchant = get_settings().paypal_merchant_id
     payee = payee_merchant_id(event)
     # A valid signature proves PayPal sent it, not that it's about OUR account: park mismatches.
-    # Captures always name their payee (every real sandbox capture did), so a capture without one is
-    # parked too. Payout events never carry a payee; PayPal only delivers events from the app the
-    # webhook is registered to, so a payout's account is fixed by the registration itself.
+    # Captures always name their payee (every real sandbox capture did), so a processed capture type
+    # without one is parked too. Other payee-less events (payouts, refunds) are accepted. Payouts
+    # never carry a payee; PayPal only delivers events from the app the webhook is registered to, so
+    # a payout's account is fixed by the registration itself.
     event_type = str(event.get("event_type", ""))
     if payee is None:
-        quarantined = event_type.startswith("PAYMENT.CAPTURE.")
+        quarantined = event_type in CAPTURE_EVENTS
         reason = f"{event_type} has no payee merchant ID"
     else:
         quarantined = payee != expected_merchant
@@ -254,10 +255,46 @@ async def paypal_webhook(request: Request, background: BackgroundTasks) -> JSONR
         return JSONResponse({"outcome": "storage_unavailable"}, status_code=503)
 
     if quarantined:
-        log.warning("quarantined webhook %s for merchant %s", row.event_id, payee)
+        log.warning("QUARANTINED webhook %s (%s): %s", row.event_id, event_type, reason)
         return JSONResponse({"outcome": "quarantined"}, status_code=200)
     background.add_task(process_pending, request.app.state.paypal.get_order)
     return JSONResponse({"outcome": "accepted"}, status_code=200)
+
+
+@app.get("/summary", dependencies=[Depends(require_owner)])
+def summary() -> dict[str, Any]:
+    """Counts the owner should glance at first, including events that were parked and never processed."""
+    with db.session_scope() as session:
+        incidents = dict(session.execute(select(Incident.kind, func.count(Incident.id)).group_by(Incident.kind)).all())
+        events = dict(
+            session.execute(
+                select(WebhookEvent.status, func.count(WebhookEvent.id)).group_by(WebhookEvent.status)
+            ).all()
+        )
+        active_hits = session.scalar(select(func.count(RuleHit.id)).where(RuleHit.superseded_by.is_(None))) or 0
+    return {
+        "incidents_by_kind": incidents,
+        "webhook_events_by_status": events,
+        "active_rule_hits": active_hits,
+        "attention": [
+            msg
+            for msg, show in (
+                (
+                    f"{events.get('quarantined', 0)} quarantined event(s): see /webhook-events?status=quarantined",
+                    events.get("quarantined", 0) > 0,
+                ),
+                (
+                    f"{events.get('failed', 0)} failed event(s): see /webhook-events?status=failed",
+                    events.get("failed", 0) > 0,
+                ),
+                (
+                    f"{incidents.get('partial_pattern', 0)} pattern(s) need review",
+                    incidents.get("partial_pattern", 0) > 0,
+                ),
+            )
+            if show
+        ],
+    }
 
 
 @app.get("/rule-hits", dependencies=[Depends(require_owner)])

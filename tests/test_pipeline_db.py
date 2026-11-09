@@ -127,19 +127,19 @@ def test_real_sandbox_events_produce_transactions_with_identities() -> None:
 def test_real_sandbox_burst_raises_indicators_but_not_the_mule_pattern() -> None:
     """In the real spike run only $50 left against ~$381 in: not a pass-through.
 
-    The fresh sandbox account has no history, so every hit is low severity: stored and visible,
-    but no incident is opened for it on its own (review round 2, finding 3)."""
+    Probe then burst is two of the three steps, so it's a low-severity "needs review" incident
+    (review round 4), not a money-mule incident."""
     store(EVENTS)
     process_pending(lookup)
     with db.session_scope() as session:
         hits = session.scalars(select(RuleHit)).all()
-        kinds = {i.kind for i in session.scalars(select(Incident))}
     rules = {h.rule_id for h in hits}
     assert {"R1_BURST_NEW_SENDERS", "R3_PROBE_PAYMENT", "R4_CURRENCY_MIX"} <= rules
     assert "R2_PASS_THROUGH" not in rules
     assert {h.severity for h in hits} == {"low"}
-    assert all(h.incident_id is None for h in hits)
-    assert kinds == set()
+    with db.session_scope() as session:
+        incidents = session.scalars(select(Incident)).all()
+        assert [(i.kind, i.severity) for i in incidents] == [("partial_pattern", "low")]
 
 
 def test_large_outflow_completes_the_mule_sequence() -> None:
@@ -346,11 +346,13 @@ def test_bigger_burst_after_the_mule_forms_replaces_the_old_hit_inside_it() -> N
 def test_busy_hour_on_an_account_with_history_opens_no_incident() -> None:
     """Review round 3, finding 2: with history R1 turns medium, but one rule alone never opens an incident."""
     names = {f"H{i}": f"Regular {i}" for i in range(4)} | {f"N{i}": f"New Buyer {i}" for i in range(3)}
-    events = [capture(f"WH-HIST0{i}", i, "25.00", f"H{i}") for i in range(4)]  # 10:00-10:03, history
-    events += [
-        payout("WH-HSUP01", 5, "61.00", "supplier@example.com"),
-        payout("WH-HSUP02", 6, "61.00", "supplier@example.com"),
+    # History: the supplier is paid first, then regular buyers (paying out right after four first-time
+    # buyers would itself be a burst + drain and open a needs-review incident).
+    events = [
+        payout("WH-HSUP01", 0, "61.00", "supplier@example.com"),
+        payout("WH-HSUP02", 1, "61.00", "supplier@example.com"),
     ]
+    events += [capture(f"WH-HIST0{i}", 2 + i, "25.00", f"H{i}") for i in range(4)]
     later = "2026-11-10T11:{m:02d}:00Z"
     for i, minute in enumerate((20, 25, 30)):
         e = capture(f"WH-NEWB0{i}", 0, "40.00", f"N{i}")
@@ -403,3 +405,45 @@ def test_demo_seed_opens_one_high_severity_incident_and_is_repeatable() -> None:
         mules = session.scalars(select(Incident).where(Incident.kind == "money_mule_pattern")).all()
         assert len(mules) == 1
         assert mules[0].severity == "high"
+
+
+def test_evader_who_drains_79_percent_still_gets_a_needs_review_incident() -> None:
+    """Review round 4, finding 1: staying just under the R2 bar must not mean silence."""
+    events, names = mule_scenario()
+    events[-1] = payout("WH-MUOUT1", 9, "237.00", "exchange@example.com")  # 237 / 300.79 = 79%
+    store(events)
+    process_pending(card_lookup(names))
+    assert "R2_PASS_THROUGH" not in rule_ids_in_db()
+    with db.session_scope() as session:
+        incidents = session.scalars(select(Incident)).all()
+        assert [(i.kind, i.severity) for i in incidents] == [("partial_pattern", "low")]
+
+
+def test_needs_review_incident_is_upgraded_in_place_when_the_drain_arrives() -> None:
+    events, names = mule_scenario()
+    store(events[:-1])  # probe + burst only
+    process_pending(card_lookup(names))
+    with db.session_scope() as session:
+        first = session.scalar(select(Incident))
+        assert first.kind == "partial_pattern"
+        first_id = first.id
+    store(events[-1:])  # the drain
+    process_pending(card_lookup(names))
+    with db.session_scope() as session:
+        incidents = session.scalars(select(Incident)).all()
+        assert [(i.id, i.kind) for i in incidents] == [(first_id, "money_mule_pattern")]
+        audit = [a.action for a in session.scalars(select(IncidentEvent).where(IncidentEvent.incident_id == first_id))]
+    assert "upgraded_to_full_pattern" in audit
+
+
+def test_demo_seed_remove_deletes_everything_it_created() -> None:
+    from scripts import demo_seed
+
+    assert demo_seed.seed()
+    counts = demo_seed.remove()
+    assert counts["events"] == 8 and counts["incidents"] == 1
+    with db.session_scope() as session:
+        assert session.scalars(select(Incident)).all() == []
+        assert session.scalars(select(Transaction)).all() == []
+        assert session.scalars(select(RuleHit)).all() == []
+        assert session.scalars(select(WebhookEvent)).all() == []
