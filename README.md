@@ -27,6 +27,17 @@ Built for the PayPal AI Hackathon (Devpost). **Sandbox only, by design:** the ap
    - If the main model (`GEMINI_MODEL`) is overloaded (429/5xx) or slower than 20 s, the request is tried once on `GEMINI_FALLBACK_MODEL`; each answer records which model replied. Without an API key, over the daily budget, or if both models fail, deterministic template answers take over. Only stable answers are cached; failures are retried next time.
    - The policy hashes detect edits since capture. They don't prove the text came from PayPal: each entry links its source.
 
+## Risk decision engine (`app/risk/`, in progress)
+
+A second, larger engine is being built next to the pattern detector above. It is pure code with tests; it is **not yet wired** to the API, the database or a payment screen.
+
+- **`engine.py`**: scores one transaction 0–100 from 45 named signals in 9 categories (velocity, device, network, identity, funding, recipient, behaviour, context, external). Fixed points per tier (LOW 3, MED 7, HIGH 12), a cap per category, five combination floors (account takeover 85, mule account 80, card testing 80, authorised scam 70, device farm 75), trust reductions that never go below a floor, and action bands (allow, step-up, hold and review, block). Evidence that is absent is never guessed: the signal scores 0 and the field is listed under `missing_data`.
+- **`snapshot.py`**: every decision is sealed with what the engine knew at that moment: encrypted (AES-256-GCM), signed, and chained to the previous record's hash, so editing, removing or reordering a record is detected. Nothing readable is stored, the score included.
+- **`complaint.py`**: when a complaint arrives, its claims are compared with the sealed snapshot, not with current data. A consistent complaint is fast-tracked for refund; an inconsistent one goes to a human reviewer and is never rejected automatically.
+- **`learning.py`**: rescoring everyone who paid a recipient once that recipient is confirmed fraudulent, a gap report for confirmed fraud the engine let through (which thresholds were just missed, which data was absent), and a library of confirmed cases grouped by type.
+
+Most signals need data that PayPal's webhooks don't carry (device, network, session behaviour). The plan is a payment app of our own, with the money moved by the PayPal sandbox, so the app can observe those itself. Telecom, breach, consortium and card-issuer signals can only be simulated in a demo and will be labelled as such.
+
 ## Measured in the PayPal sandbox (see SPIKE.md)
 
 - Webhooks: 12 of 12 signature-verified, median delivery 7.9 s. Only payments processed through this app produce webhooks.
