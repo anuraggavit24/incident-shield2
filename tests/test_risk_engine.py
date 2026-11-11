@@ -9,7 +9,15 @@ import pytest
 from app.risk.complaint import consistency
 from app.risk.engine import CATEGORY_CAPS, SIGNALS, decide, near_misses
 from app.risk.learning import gap_report, rescore_payers, scam_library
-from app.risk.snapshot import GENESIS_HASH, SnapshotError, open_snapshot, seal, verify_chain
+from app.risk.snapshot import (
+    GENESIS_HASH,
+    SnapshotError,
+    load_keyring,
+    make_checkpoint,
+    open_snapshot,
+    seal,
+    verify_chain,
+)
 
 ENC, SIGN = b"e" * 32, b"s" * 32
 NOW = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
@@ -132,7 +140,7 @@ def test_near_misses_show_how_a_case_slipped_under() -> None:
     assert decide(evidence)["floors_triggered"] == []
     report = near_misses(evidence)
     assert report["signals_just_under_threshold"] == [
-        {"signal": "R1_PASS_THROUGH", "field": "recipient_passthrough_ratio_30m", "value": 0.79, "threshold": 0.8}
+        {"signal": "RC1_PASS_THROUGH", "field": "recipient_passthrough_ratio_30m", "value": 0.79, "threshold": 0.8}
     ]
     assert report["floors_one_component_short"][0] == {
         "floor": "MULE_ACCOUNT", "one_short": "pass-through", "held": ["recipient under 60 days", "fan-in"]
@@ -180,6 +188,84 @@ def test_wrong_key_or_altered_record_cannot_be_opened() -> None:
         open_snapshot(moved, ENC)
     with pytest.raises(SnapshotError):
         seal({}, {}, GENESIS_HASH, b"short", SIGN, NOW)
+
+
+def test_chain_alone_cannot_see_removed_tail_but_a_checkpoint_does() -> None:
+    records = chain([TAKEOVER, SCAM, MULE, TAKEOVER, SCAM])
+    checkpoint = make_checkpoint(records, SIGN)
+    # without a checkpoint a truncated chain still verifies: this is the known limit
+    assert verify_chain(records[:3], SIGN) == (True, None)
+    assert verify_chain([], SIGN) == (True, None)
+    # with the checkpoint, cutting the end (or emptying the chain) is caught
+    assert verify_chain(records, SIGN, checkpoint) == (True, None)
+    assert verify_chain(records[:3], SIGN, checkpoint) == (False, 3)
+    assert verify_chain([], SIGN, checkpoint) == (False, 0)
+    # records appended after the checkpoint are fine
+    longer = chain([TAKEOVER, SCAM, MULE, TAKEOVER, SCAM, MULE])
+    assert verify_chain(longer, SIGN, make_checkpoint(longer[:5], SIGN)) == (True, None)
+    # a different valid chain of the same length (records replaced) does not contain the checkpointed head
+    replaced = chain([SCAM, MULE, TAKEOVER, SCAM, MULE])
+    assert verify_chain(replaced, SIGN) == (True, None)
+    assert verify_chain(replaced, SIGN, checkpoint) == (False, 4)
+    # a forged or edited checkpoint is rejected
+    assert verify_chain(records, SIGN, {**checkpoint, "count": 2})[0] is False
+    assert verify_chain(records, b"x" * 32, checkpoint)[0] is False
+    assert verify_chain([], SIGN, make_checkpoint([], SIGN)) == (True, None)
+
+
+def test_old_records_stay_readable_after_the_key_is_rotated() -> None:
+    old = seal(decide(TAKEOVER), TAKEOVER, GENESIS_HASH, ENC, SIGN, NOW, key_id="k1")
+    new_enc, new_sign = b"E" * 32, b"S" * 32
+    new = seal(decide(SCAM), SCAM, old["record_hash"], new_enc, new_sign, NOW, key_id="k2")
+    enc_ring, sign_ring = {"k1": ENC, "k2": new_enc}, {"k1": SIGN, "k2": new_sign}
+    assert verify_chain([old, new], sign_ring) == (True, None)
+    assert open_snapshot(old, enc_ring)["decision"]["score"] == 85
+    assert open_snapshot(new, enc_ring)["decision"]["typology"] == "authorised_scam"
+    assert verify_chain([old, new], {"k1": SIGN}) == (False, 1)  # unknown key id
+    with pytest.raises(SnapshotError):
+        open_snapshot(new, {"k1": ENC})
+
+
+def test_keyring_loads_from_environment_and_rejects_bad_keys() -> None:
+    env = {
+        "RISK_ENC_KEY_K1": "11" * 32,
+        "RISK_SIGN_KEY_K1": "22" * 32,
+        "RISK_ENC_KEY_K2": "33" * 32,
+        "RISK_SIGN_KEY_K2": "44" * 32,
+        "RISK_ACTIVE_KEY_ID": "K2",
+    }
+    ring = load_keyring(env)
+    assert ring["active"] == "k2" and set(ring["enc"]) == {"k1", "k2"} and ring["sign"]["k1"] == b"\x22" * 32
+    with pytest.raises(SnapshotError):
+        load_keyring({**env, "RISK_ACTIVE_KEY_ID": "k9"})
+    with pytest.raises(SnapshotError):
+        load_keyring({**env, "RISK_ENC_KEY_K1": "abcd"})
+    with pytest.raises(SnapshotError):
+        load_keyring({**env, "RISK_SIGN_KEY_K1": "zz" * 32})
+
+
+# ---- malformed evidence
+
+
+def test_wrong_type_evidence_never_crashes_and_is_reported() -> None:
+    bad = {"sim_swap_days_ago": "3", "amount_zscore_90d": "huge", "dormant_days": None, "new_device": "yes"}
+    result = decide(bad)
+    assert result["score"] == 0 and "sim_swap_days_ago" in result["invalid_data"]
+    assert "amount_zscore_90d" in result["invalid_data"]
+    assert near_misses(bad)["signals_just_under_threshold"] == []
+    # valid evidence in the same record still scores
+    mixed = decide({**TAKEOVER, "amount_zscore_90d": "huge"})
+    assert mixed["score"] == 85 and mixed["invalid_data"] == ["amount_zscore_90d"]
+    assert decide(TAKEOVER)["invalid_data"] == []
+
+
+def test_engine_rule_ids_do_not_clash_with_the_incident_rules() -> None:
+    import re
+    from pathlib import Path
+
+    incident_rules = set(re.findall(r'rule_id="([A-Z0-9_]+)"', Path("app/rules.py").read_text()))
+    assert "R2_PASS_THROUGH" in incident_rules  # guards the regex itself
+    assert not incident_rules & {s.id for s in SIGNALS}
 
 
 # ---- complaint consistency
@@ -236,7 +322,7 @@ def test_confirmed_fraud_recipient_rescoring_finds_likely_victims() -> None:
 def test_gap_report_and_scam_library_group_what_got_through() -> None:
     slipped = {**MULE, "recipient_passthrough_ratio_30m": 0.79}
     report = gap_report(snap(slipped), "mule_activity")
-    assert report["let_through"] and report["signals_just_under_threshold"][0]["signal"] == "R1_PASS_THROUGH"
+    assert report["let_through"] and report["signals_just_under_threshold"][0]["signal"] == "RC1_PASS_THROUGH"
     library = scam_library([
         {"snapshot": snap(slipped), "outcome": "fraud", "typology": "mule_activity"},
         {"snapshot": snap(MULE), "outcome": "fraud", "typology": "mule_activity"},
@@ -245,5 +331,5 @@ def test_gap_report_and_scam_library_group_what_got_through() -> None:
     ])  # fmt: skip
     mule = library["mule_activity"]
     assert (mule["cases"], mule["held_or_blocked"], mule["let_through"]) == (2, 1, 1)
-    assert mule["thresholds_most_often_just_missed"] == [("R1_PASS_THROUGH", 1)]
+    assert mule["thresholds_most_often_just_missed"] == [("RC1_PASS_THROUGH", 1)]
     assert library["takeover"]["cases"] == 1 and library["_false_alarms"] == {"cases": 1, "held_or_blocked": 1}

@@ -5,6 +5,9 @@ Rules (rule set RULESET_VERSION):
   and capped per category, then the total is capped at 100.
 - Trust reductions are subtracted. Combination floors set a minimum the score can't go below.
 - Evidence that is absent is never guessed: the signal scores 0 and the field is listed in missing_data.
+- Evidence of the wrong type (a string where a number is needed) never crashes the scorer: the signal
+  scores 0 and the field is listed in invalid_data. Callers must validate input before it gets here;
+  because withheld or garbled evidence lowers a score, wiring this in without validation is unsafe.
 - `source` says where a signal's evidence comes from: "app" (our payment app sees it), "ledger" (our
   own transaction records and PayPal webhooks) or "external" (telecom, breach, consortium or issuer
   data the demo can only simulate).
@@ -35,6 +38,16 @@ NEAR_MISS_SHARE = 0.7  # a numeric signal at 70%+ of its threshold counts as a n
 
 Evidence = Mapping[str, Any]
 Test = Callable[[Evidence], bool]
+_BAD_VALUE = (TypeError, ValueError, ArithmeticError, AttributeError)
+
+
+def _holds(test: Callable[..., bool], invalid: set[str], names: tuple[str, ...], *args: Any) -> bool:
+    """Run one test; evidence of the wrong type counts as not fired and is recorded in `invalid`."""
+    try:
+        return bool(test(*args))
+    except _BAD_VALUE:
+        invalid.update(names)
+        return False
 
 
 @dataclass(frozen=True)
@@ -126,9 +139,9 @@ SIGNALS: tuple[Signal, ...] = (
     _over("F5_MANY_INSTRUMENTS_ADDED", "funding", "HIGH", "instruments_added_24h", 3),
     _flag("F6_INSTRUMENT_PRIOR_CHARGEBACK", "funding", "HIGH", "instrument_prior_chargeback", "ledger"),
     # 6. Recipient and mule indicators
-    _over("R1_PASS_THROUGH", "recipient", "HIGH", "recipient_passthrough_ratio_30m", 0.8, "ledger"),
+    _over("RC1_PASS_THROUGH", "recipient", "HIGH", "recipient_passthrough_ratio_30m", 0.8, "ledger"),
     Signal(
-        "R2_FAN_IN_YOUNG_ACCOUNT",
+        "RC2_FAN_IN_YOUNG_ACCOUNT",
         "recipient",
         "HIGH",
         ("recipient_senders_7d", "recipient_account_age_days"),
@@ -136,23 +149,23 @@ SIGNALS: tuple[Signal, ...] = (
         "ledger",
     ),
     Signal(
-        "R3_LINKED_TO_FRAUD",
+        "RC3_LINKED_TO_FRAUD",
         "recipient",
         "HIGH",
         ("recipient_hops_to_fraud",),
         lambda e: e["recipient_hops_to_fraud"] <= 2,
     ),
     Signal(
-        "R4_RECIPIENT_PRIOR_COMPLAINTS",
+        "RC4_RECIPIENT_PRIOR_COMPLAINTS",
         "recipient",
         "HIGH",
         ("recipient_prior_complaints",),
         lambda e: e["recipient_prior_complaints"] >= 1,
         "ledger",
     ),
-    _flag("R5_PAYEE_NAME_MISMATCH", "recipient", "MED", "payee_name_mismatch"),
-    _flag("R6_HIGH_RISK_CASH_OUT", "recipient", "MED", "recipient_high_risk_cashout", "ledger"),
-    _over("R7_INBOUND_ABOVE_PROFILE", "recipient", "MED", "recipient_inbound_vs_profile_ratio", 5, "ledger"),
+    _flag("RC5_PAYEE_NAME_MISMATCH", "recipient", "MED", "payee_name_mismatch"),
+    _flag("RC6_HIGH_RISK_CASH_OUT", "recipient", "MED", "recipient_high_risk_cashout", "ledger"),
+    _over("RC7_INBOUND_ABOVE_PROFILE", "recipient", "MED", "recipient_inbound_vs_profile_ratio", 5, "ledger"),
     # 7. Behavioural biometrics (deviation flags only; raw keystrokes are never stored)
     _flag("B1_TYPING_DEVIATION", "behaviour", "MED", "typing_deviation"),
     _flag("B2_COACHING_SIGNS", "behaviour", "MED", "coaching_signs"),
@@ -230,8 +243,8 @@ FLOORS: tuple[tuple[str, str, int, tuple[Component, ...]], ...] = (
                 ("recipient_account_age_days",),
                 lambda e, f: e["recipient_account_age_days"] < 60,
             ),
-            ("fan-in", (), _fired("R2_FAN_IN_YOUNG_ACCOUNT")),
-            ("pass-through", (), _fired("R1_PASS_THROUGH")),
+            ("fan-in", (), _fired("RC2_FAN_IN_YOUNG_ACCOUNT")),
+            ("pass-through", (), _fired("RC1_PASS_THROUGH")),
         ),
     ),
     (
@@ -284,12 +297,17 @@ def band_for(score: int) -> str:
     return next(name for minimum, name in BANDS if score >= minimum)
 
 
-def _floor_state(e: Evidence, fired: set[str]) -> list[dict[str, Any]]:
+def _at_least_share(value: Any, threshold: float) -> bool:
+    return bool(value >= threshold * NEAR_MISS_SHARE)
+
+
+def _floor_state(e: Evidence, fired: set[str], invalid: set[str] | None = None) -> list[dict[str, Any]]:
+    invalid = invalid if invalid is not None else set()
     states = []
     for floor_id, typology, minimum, components in FLOORS:
         held, lacking = [], []
         for name, needs, test in components:
-            ok = all(n in e for n in needs) and test(e, fired)
+            ok = all(n in e for n in needs) and _holds(test, invalid, needs, e, fired)
             (held if ok else lacking).append(name)
         states.append({"id": floor_id, "typology": typology, "floor": minimum, "held": held, "lacking": lacking})
     return states
@@ -300,11 +318,12 @@ def decide(evidence: Evidence) -> dict[str, Any]:
     e = {k: v for k, v in evidence.items() if v is not None}
     fired: list[dict[str, Any]] = []
     missing: set[str] = set()
+    invalid: set[str] = set()
     for s in SIGNALS:
         lacking = [n for n in s.needs if n not in e]
         if lacking:
             missing.update(lacking)
-        elif s.test(e):
+        elif _holds(s.test, invalid, s.needs, e):
             fired.append(
                 {
                     "name": s.id,
@@ -328,10 +347,10 @@ def decide(evidence: Evidence) -> dict[str, Any]:
         lacking = [n for n in needs if n not in e]
         if lacking:
             missing.update(lacking)
-        elif test(e):
+        elif _holds(test, invalid, needs, e):
             reductions.append({"name": rid, "points": -points, "raw_value": {n: e[n] for n in needs}})
 
-    floor_states = _floor_state(e, fired_ids)
+    floor_states = _floor_state(e, fired_ids, invalid)
     floors = [
         {"name": s["id"], "floor": s["floor"], "typology": s["typology"]} for s in floor_states if not s["lacking"]
     ]
@@ -365,6 +384,7 @@ def decide(evidence: Evidence) -> dict[str, Any]:
         "floors_triggered": floors,
         "reductions_applied": reductions,
         "missing_data": sorted(missing),
+        "invalid_data": sorted(invalid),
         "reason_codes": reason_codes,
     }
 
@@ -379,7 +399,7 @@ def near_misses(evidence: Evidence) -> dict[str, list[dict[str, Any]]]:
         if s.near is None or s.id in fired or s.near[0] not in e:
             continue
         field, threshold = s.near
-        if e[field] >= threshold * NEAR_MISS_SHARE:
+        if _holds(_at_least_share, set(), (field,), e[field], threshold):
             signals.append({"signal": s.id, "field": field, "value": e[field], "threshold": threshold})
     floors = [
         {"floor": s["id"], "one_short": s["lacking"][0], "held": s["held"]}
