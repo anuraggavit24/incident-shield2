@@ -1,8 +1,0 @@
-# Pinned for reproducibility. The product will use a full lock file (direct + transitive).
-fastapi==0.162.0
-uvicorn[standard]==0.54.0
-httpx==0.28.1
-python-dotenv==1.2.4
-psycopg[binary]==3.3.8
-pytest==9.2.0
-ruff==0.17.4
