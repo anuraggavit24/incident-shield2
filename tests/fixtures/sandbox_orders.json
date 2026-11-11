@@ -1,0 +1,85 @@
+{
+ "2FP414230D0118525": {
+  "payment_source": {
+   "card": {
+    "name": "Test Sender Alpha",
+    "last_digits": "1881",
+    "brand": "VISA",
+    "type": "CREDIT"
+   }
+  }
+ },
+ "7G548579XT1864800": {
+  "payment_source": {
+   "card": {
+    "name": "Test Sender Alpha",
+    "last_digits": "1881",
+    "brand": "VISA",
+    "type": "CREDIT"
+   }
+  }
+ },
+ "2TN7251323160421J": {
+  "payment_source": {
+   "paypal": {
+    "email_address": "sb-c0cam53772012@personal.example.com",
+    "account_id": "63HPNVEKUH8WE",
+    "account_status": "VERIFIED",
+    "name": {
+     "given_name": "John",
+     "surname": "Doe"
+    }
+   }
+  }
+ },
+ "8NH233524F587213D": {
+  "payment_source": {
+   "card": {
+    "name": "Test Sender Echo",
+    "last_digits": "1881",
+    "brand": "VISA",
+    "type": "CREDIT"
+   }
+  }
+ },
+ "3EY39779BN244882M": {
+  "payment_source": {
+   "card": {
+    "name": "Test Sender Alpha",
+    "last_digits": "1881",
+    "brand": "VISA",
+    "type": "CREDIT"
+   }
+  }
+ },
+ "8G419394AF477984L": {
+  "payment_source": {
+   "card": {
+    "name": "Test Sender Bravo",
+    "last_digits": "1881",
+    "brand": "VISA",
+    "type": "CREDIT"
+   }
+  }
+ },
+ "90M41043LR797311S": {
+  "payment_source": {
+   "card": {
+    "name": "Test Sender Charlie",
+    "last_digits": "1881",
+    "brand": "VISA",
+    "type": "CREDIT"
+   }
+  }
+ },
+ "3AV46465GL0321621": {
+  "payment_source": {
+   "card": {
+    "name": "Test Sender Delta",
+    "last_digits": "1881",
+    "brand": "VISA",
+    "type": "CREDIT"
+   }
+  }
+ }
+}

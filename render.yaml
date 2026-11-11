@@ -1,0 +1,45 @@
+# Render Blueprint for Incident Shield (free plan, one instance, one worker).
+# Render dashboard: New > Blueprint > pick this repo. Fill the "sync: false" values when prompted.
+services:
+  - type: web
+    name: incident-shield
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    # The free plan has no pre-deploy step, so migrations run at start. They're idempotent: a no-op
+    # when the schema is already at head. One uvicorn worker: the in-memory rate limiter and the
+    # per-process lock assume it (event rows are also claimed with SKIP LOCKED as a backstop).
+    startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    # /health/live doesn't touch the database, so a slow cold Neon connect can't fail the deploy.
+    healthCheckPath: /health/live
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.15  # the version every test and the spike ran on
+      - key: PAYPAL_API_BASE
+        value: https://api-m.sandbox.paypal.com  # anything else fails startup
+      - key: MERCHANT_CLIENT_ID
+        sync: false
+      - key: MERCHANT_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_WEBHOOK_ID
+        sync: false  # the webhook registered against THIS Render URL, not the tunnel one
+      - key: PAYPAL_MERCHANT_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_URL_UNPOOLED
+        sync: false
+      - key: OWNER_API_KEY_SHA256
+        sync: false  # the hash from scripts/make_owner_key.py, never the key itself
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
+      - key: GEMINI_FALLBACK_MODEL
+        value: gemini-3.8-flash
+      - key: COPILOT_DAILY_BUDGET
+        value: "40"
+      - key: PROCESS_INTERVAL_S
+        value: "30"

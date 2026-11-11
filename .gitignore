@@ -1,0 +1,10 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+spike_logs/
+.ruff_cache/
+node_modules/
+*.zip
