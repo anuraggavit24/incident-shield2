@@ -49,8 +49,22 @@ def reviewers() -> dict[str, str]:
     return out
 
 
+def owner_key_expired() -> bool:
+    """OWNER_KEY_EXPIRES=YYYY-MM-DD makes the owner key stop working after that day, forcing a rotation.
+    Unset means no expiry. An unreadable date means expired: a typo must not turn the limit off."""
+    raw = os.getenv("OWNER_KEY_EXPIRES", "").strip()
+    if not raw:
+        return False
+    try:
+        return date.fromisoformat(raw) < today()
+    except ValueError:
+        return True
+
+
 def _is_owner(key: str | None) -> bool:
-    return bool(key) and hmac.compare_digest(hash_api_key(key or ""), get_settings().owner_api_key_sha256)
+    if not key or owner_key_expired():
+        return False
+    return hmac.compare_digest(hash_api_key(key), get_settings().owner_api_key_sha256)
 
 
 def require_owner(x_api_key: str | None = Security(api_key_header)) -> None:

@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import AppComplaint, AppPayment, AppUser
-from .graph import confirmed_fraud_accounts, fraud_distance
+from .graph import account_features, confirmed_fraud_accounts, fraud_distance
 
 COMPLETED = "captured"
 CONFIRMED_FRAUD = ("refund_approved", "refunded")
@@ -49,12 +49,13 @@ def fingerprint_hash(fp: dict[str, Any]) -> str:
 
 
 def sanitize_simulated(sim: dict[str, Any]) -> dict[str, Any]:
-    """Keep only known fields with the right type. Anything else is dropped, never trusted."""
+    """Keep only known fields with the right type, and only values that ADD risk. A simulated `false` is
+    dropped: the demo switches exist to show a signal firing, never to switch a real one off."""
     out: dict[str, Any] = {}
     for key, kind in SIMULATABLE.items():
         value = sim.get(key)
-        if kind is bool and isinstance(value, bool):
-            out[key] = value
+        if kind is bool and value is True:
+            out[key] = True
         elif kind is int and isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 365:
             out[key] = value
     return out
@@ -87,10 +88,11 @@ def build_evidence(
         session.scalars(
             select(AppPayment)
             .where(AppPayment.payer_id == payer.id, AppPayment.created_at >= now - timedelta(days=90))
-            .order_by(AppPayment.created_at)
+            .order_by(AppPayment.created_at.desc())  # if there are more than the limit, keep the NEWEST
             .limit(1000)
         )
     )
+    attempts.reverse()  # oldest first, as the code below expects
     done = [p for p in attempts if p.status == COMPLETED]
     to_payee = [p for p in done if p.payee_id == payee.id]
 
@@ -212,12 +214,16 @@ def build_evidence(
     if in_30 > 0:
         e["recipient_passthrough_ratio_30m"] = round(out_30 / in_30, 2)
     payee_payment_ids_all = select(AppPayment.id).where(AppPayment.payee_id == payee.id)
-    e["recipient_prior_complaints"] = len(
-        set(session.scalars(select(AppComplaint.payer_id).where(AppComplaint.payment_id.in_(payee_payment_ids_all))))
-    )
+    counted = select(AppComplaint.payer_id).where(AppComplaint.payment_id.in_(payee_payment_ids_all))
+    if payee.fraud_cleared_at is not None:  # the owner cleared the flag: earlier complaints no longer count
+        counted = counted.where(AppComplaint.created_at > payee.fraud_cleared_at)
+    e["recipient_prior_complaints"] = len(set(session.scalars(counted)))
     # Graph distance to a confirmed-fraud account, by completed payments or a shared device (risk/graph.py).
     distance = fraud_distance(session, payee.id, fraud, now)
     e["recipient_hops_to_fraud"] = NOT_LINKED if distance is None else distance
+    features = account_features(session, payee.id, now)
+    e["recipient_fan_out_1h"] = features["fan_out_1h"]
+    e["recipient_device_ring_size"] = features["device_ring_size"]
     e["on_negative_list"] = payee.id in fraud
 
     # ---- what the payer typed and how
@@ -240,7 +246,9 @@ def build_evidence(
         e["direct_to_new_payee_max_amount"] = bool(e["new_payee"] and amount_f >= 2 * max(amounts))
 
     # ---- simulated (only things this app cannot observe), clearly marked
-    sim = sanitize_simulated(simulated)
+    # Simulated values can never replace something the ledger worked out: they only fill a field the app
+    # could not see. (A forged {"on_negative_list": false} used to erase a confirmed-fraud flag.)
+    sim = {k: v for k, v in sanitize_simulated(simulated).items() if k not in e or e[k] is False}
     e.update(sim)
     if sim:
         e["simulated_fields"] = sorted(sim)

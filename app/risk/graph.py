@@ -11,41 +11,77 @@ Two uses:
 - neighbourhood(): what a reviewer sees for one account: who it paid, who paid it, which devices and networks
   it shares with whom, and the findings below.
 
+Fan-out and device-ring size are also scored by the engine (signals RC8 and RC9), not only shown.
+
 Limits: device ids and networks are reported by the browser, so a careful attacker can avoid sharing them;
-shared networks alone (a household, an office, a campus) are shown but never count as a fraud link.
+shared networks alone (a household, an office, a campus) are shown but never count as a fraud link. A shared
+device does link accounts, which catches rings and also catches households: the owner can mark a device as
+legitimately shared (shared_devices) and it then links nobody.
 """
 
 from __future__ import annotations
 
+import threading
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from ..models import AppComplaint, AppPayment, AppUser
+from ..models import AppComplaint, AppPayment, AppUser, SharedDevice
 
 COMPLETED = "captured"
 CONFIRMED_FRAUD = ("refund_approved", "refunded")
-WINDOW_DAYS = 30
+WINDOW_DAYS = 30  # payments older than this are not in the graph
+DEVICE_LINK_DAYS = 14  # a shared device links accounts only if each used it this recently
 FAN_IN_SENDERS = 5  # distinct payers in 7 days
 FAN_OUT_PAYEES = 4  # distinct payees paid within an hour of receiving money
 RING_SIZE = 3  # accounts tied together by shared devices
 
 
 def confirmed_fraud_accounts(session: Session) -> set[int]:
-    """Accounts that received a payment a reviewer confirmed as fraud (refund approved)."""
+    """Accounts that received a payment a reviewer confirmed as fraud (refund approved), unless the owner has
+    since cleared the flag (complaints filed before the clearing no longer count)."""
     rows = session.execute(
         select(AppPayment.payee_id)
         .join(AppComplaint, AppComplaint.payment_id == AppPayment.id)
-        .where(AppComplaint.status.in_(CONFIRMED_FRAUD))
+        .join(AppUser, AppUser.id == AppPayment.payee_id)
+        .where(
+            AppComplaint.status.in_(CONFIRMED_FRAUD),
+            or_(AppUser.fraud_cleared_at.is_(None), AppComplaint.created_at > AppUser.fraud_cleared_at),
+        )
     ).all()
     return {r[0] for r in rows}
 
 
-def _rows(session: Session, now: datetime) -> list[Any]:
-    return list(
+_cache: dict[str, Any] = {"key": None, "value": None}
+_cache_lock = threading.Lock()
+
+
+def _snapshot(
+    session: Session, now: datetime
+) -> tuple[list[Any], dict[int, set[int]], dict[str, set[int]], dict[str, set[int]]]:
+    """(rows, account links, accounts per device, accounts per network) for the window.
+
+    Rebuilt only when the ledger changed: the cache key is a cheap aggregate (row count, newest id, number
+    completed, allowlist size, the day). One process only; a second worker would keep its own copy."""
+    since = now - timedelta(days=WINDOW_DAYS)
+    key = (
+        *session.execute(
+            select(
+                func.count(AppPayment.id),
+                func.max(AppPayment.id),
+                func.count(AppPayment.captured_at),
+            ).where(AppPayment.created_at >= since, AppPayment.seeded.is_(False))
+        ).one(),
+        session.scalar(select(func.count(SharedDevice.device_id))),
+        now.date().isoformat(),
+    )
+    with _cache_lock:
+        if _cache["key"] == key:
+            return _cache["value"]
+    rows = list(
         session.execute(
             select(
                 AppPayment.payer_id,
@@ -55,28 +91,64 @@ def _rows(session: Session, now: datetime) -> list[Any]:
                 AppPayment.status,
                 AppPayment.amount,
                 AppPayment.created_at,
-            ).where(AppPayment.created_at >= now - timedelta(days=WINDOW_DAYS), AppPayment.seeded.is_(False))
+            ).where(AppPayment.created_at >= since, AppPayment.seeded.is_(False))
         ).all()
     )
-
-
-def _links(rows: list[Any]) -> tuple[dict[int, set[int]], dict[str, set[int]], dict[str, set[int]]]:
-    """(account-to-account links by payment or shared device, accounts per device, accounts per network)."""
+    allowed = set(session.scalars(select(SharedDevice.device_id)))
+    device_since = now - timedelta(days=DEVICE_LINK_DAYS)
     paid: dict[int, set[int]] = defaultdict(set)
     by_device: dict[str, set[int]] = defaultdict(set)
     by_ip: dict[str, set[int]] = defaultdict(set)
-    for payer, payee, device, ip, status, _, _ in rows:
+    for payer, payee, device, ip, status, _, at in rows:
         if status == COMPLETED:
             paid[payer].add(payee)
             paid[payee].add(payer)
-        if device:
+        # Old device use counts for nothing: a link needs both accounts on the device recently. Devices the
+        # owner marked as legitimately shared (household, office) never link anyone.
+        if device and device not in allowed and at >= device_since:
             by_device[device].add(payer)
         if ip:
             by_ip[ip].add(payer)
     for accounts in by_device.values():  # a shared device links every account that used it
         for a in accounts:
             paid[a] |= accounts - {a}
-    return paid, by_device, by_ip
+    value = (rows, paid, by_device, by_ip)
+    with _cache_lock:
+        _cache["key"], _cache["value"] = key, value
+    return value
+
+
+def _ring(account_id: int, by_device: dict[str, set[int]]) -> set[int]:
+    """Every account reachable from this one through shared devices only."""
+    ring, queue = {account_id}, deque([account_id])
+    while queue:
+        node = queue.popleft()
+        for accounts in by_device.values():
+            if node in accounts:
+                for other in accounts - ring:
+                    ring.add(other)
+                    queue.append(other)
+    return ring
+
+
+def _fan_out(account_id: int, rows: list[Any]) -> int:
+    """Distinct accounts paid within an hour of this account receiving money."""
+    received = sorted(at for _, payee, _, _, s, _, at in rows if payee == account_id and s == COMPLETED)
+    return len(
+        {
+            payee
+            for payer, payee, _, _, s, _, at in rows
+            if payer == account_id
+            and s == COMPLETED
+            and any(timedelta(0) <= at - r <= timedelta(hours=1) for r in received)
+        }
+    )
+
+
+def account_features(session: Session, account_id: int, now: datetime) -> dict[str, int]:
+    """Graph features of one account for the engine: fan-out after receipt, and device-ring size."""
+    rows, _, by_device, _ = _snapshot(session, now)
+    return {"fan_out_1h": _fan_out(account_id, rows), "device_ring_size": len(_ring(account_id, by_device))}
 
 
 def fraud_distance(session: Session, account_id: int, fraud: set[int], now: datetime, limit: int = 2) -> int | None:
@@ -85,7 +157,7 @@ def fraud_distance(session: Session, account_id: int, fraud: set[int], now: date
         return 0
     if not fraud:
         return None
-    links, _, _ = _links(_rows(session, now))
+    _, links, _, _ = _snapshot(session, now)
     seen, queue = {account_id}, deque([(account_id, 0)])
     while queue:
         node, dist = queue.popleft()
@@ -104,8 +176,7 @@ def neighbourhood(session: Session, handle: str, now: datetime) -> dict[str, Any
     user = session.scalar(select(AppUser).where(AppUser.handle == handle))
     if user is None:
         return None
-    rows = _rows(session, now)
-    links, by_device, by_ip = _links(rows)
+    rows, _, by_device, by_ip = _snapshot(session, now)
     fraud = confirmed_fraud_accounts(session)
     names = dict(session.execute(select(AppUser.id, AppUser.handle)).all())
     me = user.id
@@ -131,24 +202,9 @@ def neighbourhood(session: Session, handle: str, now: datetime) -> dict[str, Any
     shared_networks = [
         {"network": i[:8], "accounts": sorted(names[a] for a in by_ip[i])} for i in sorted(my_ips) if len(by_ip[i]) > 1
     ]
-
-    # ring: every account reachable from this one through shared devices only
-    ring, queue = {me}, deque([me])
-    while queue:
-        node = queue.popleft()
-        for accounts in by_device.values():
-            if node in accounts:
-                for other in accounts - ring:
-                    ring.add(other)
-                    queue.append(other)
-
+    ring = _ring(me, by_device)
     senders_7d = {p for p, payee, _, _, s, _, at in rows if payee == me and s == COMPLETED and at >= week}
-    received = sorted(at for _, payee, _, _, s, _, at in rows if payee == me and s == COMPLETED)
-    quick_payees = {
-        payee
-        for payer, payee, _, _, s, _, at in rows
-        if payer == me and s == COMPLETED and any(timedelta(0) <= at - r <= timedelta(hours=1) for r in received)
-    }
+    fan_out = _fan_out(me, rows)
 
     findings: list[dict[str, Any]] = []
     if me in fraud:
@@ -160,9 +216,13 @@ def neighbourhood(session: Session, handle: str, now: datetime) -> dict[str, Any
         )
     if len(senders_7d) >= FAN_IN_SENDERS:
         findings.append({"finding": "fan_in", "detail": f"{len(senders_7d)} different payers in 7 days"})
-    if len(quick_payees) >= FAN_OUT_PAYEES:
+    if fan_out >= FAN_OUT_PAYEES:
         findings.append(
-            {"finding": "fan_out", "detail": f"paid {len(quick_payees)} accounts within an hour of receiving money"}
+            {
+                "finding": "fan_out",
+                "detail": f"paid {fan_out} accounts within an hour of receiving money",
+                "scored_as": "RC8",
+            }
         )
     if len(ring) >= RING_SIZE:
         findings.append(
@@ -171,11 +231,13 @@ def neighbourhood(session: Session, handle: str, now: datetime) -> dict[str, Any
                 "detail": f"{len(ring)} accounts tied together by shared devices",
                 "accounts": sorted(names[a] for a in ring),
                 "includes_confirmed_fraud": bool(ring & fraud),
+                "scored_as": "RC9",
             }
         )
     return {
         "account": handle,
         "window_days": WINDOW_DAYS,
+        "device_link_days": DEVICE_LINK_DAYS,
         "paid_to": [
             {"account": names[a], "payments": len(v), "total": round(sum(v), 2)} for a, v in sorted(paid_to.items())
         ],

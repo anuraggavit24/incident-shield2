@@ -99,6 +99,11 @@ $("verify").addEventListener("click", async () => {
 });
 $("ckpt").addEventListener("click", async () => { try { $("chain-out").textContent = JSON.stringify(await api("/risk/checkpoint"), null, 2) + "\n\nSave this OUTSIDE the database."; } catch (e) { $("chain-out").textContent = e.message; } });
 $("lib").addEventListener("click", async () => { try { $("chain-out").textContent = JSON.stringify(await api("/risk/scam-library"), null, 2); } catch (e) { $("chain-out").textContent = e.message; } });
-for (const [id, path] of [["audit", "/review/audit"], ["labels", "/risk/labels"], ["metrics", "/metrics"], ["recon", "/review/reconcile"]]) {
+for (const [id, path] of [["audit", "/review/audit?include_reads=true"], ["labels", "/risk/labels"], ["auditv", "/review/audit/verify"], ["shadow", "/risk/shadow"], ["metrics", "/metrics"], ["recon", "/review/reconcile"]]) {
   $(id).addEventListener("click", async () => { try { $("chain-out").textContent = JSON.stringify(await api(path), null, 2); } catch (e) { $("chain-out").textContent = e.message + " (owner key needed)"; } });
 }
+$("clear").addEventListener("click", async () => {
+  const handle = prompt("Account handle to clear the fraud flag for:"); if (!handle) return;
+  const reason = prompt("Reason (recorded in the sealed audit chain):"); if (!reason) return;
+  try { $("chain-out").textContent = JSON.stringify(await api("/risk/fraud-flag/" + encodeURIComponent(handle.trim()) + "/clear", "POST", { reason }), null, 2); } catch (e) { $("chain-out").textContent = e.message; }
+});

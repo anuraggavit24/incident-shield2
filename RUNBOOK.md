@@ -12,6 +12,8 @@ For one Render free instance and one Neon database. Sandbox prototype: there is 
 | Review backlog | `GET /metrics` → `oldest_open_complaint_seconds` | Above your target (for example 3600) |
 | Ledger agrees with PayPal | `GET /review/reconcile` | `ok` is false: see "Ledger mismatch" |
 | Sealed records intact | `POST /risk/verify` with the saved checkpoint | `ok` is false: see "Chain fails" |
+| Alerts | `python scripts/check_alerts.py <base-url>` (owner key in `OWNER_API_KEY`); exits 1 on any alert | Run it from a scheduler every few minutes |
+| Audit chain intact | `GET /review/audit/verify?expected_count=<audit_count from the saved checkpoint>` | `ok` is false: treat like "Chain fails" |
 | Logs | Render → Logs. Every payment event is one JSON line: `{"event": ..., "payment_id": ..., "actor": ...}` | Search by `payment_id` |
 
 `/metrics`, `/review/reconcile`, `/review/audit` and `/risk/*` need the owner key in `X-API-Key`.
@@ -26,11 +28,16 @@ There is no alerting: someone has to look. An uptime monitor on `/health/ready` 
   to `REVIEWERS` on Render, redeploy. Keys stop working after their last day (default 30 days): reissue before then.
   Refunds of $100 or more need two different reviewers, so keep at least two valid keys. **Remove one:** delete their entry, redeploy. Their past actions stay in `/review/audit`.
 
+- **Between demo takes:** `POST /risk/fraud-flag/{handle}/clear` with a reason, for any payee a refund was approved against. Otherwise the next payment to it is held.
+- **Monthly:** `python scripts/retention.py 180` (dry run), then with `--confirm`.
+- **Owner key:** set `OWNER_KEY_EXPIRES` to a date and rotate before it. After that day the owner key is refused everywhere; fix by setting a new hash and date on Render.
+- **Service targets (not yet measured in production):** `/health/ready` up 99.5% of the time; scoring p95 under 800 ms (`scoring_ms_p95_24h` in `/metrics`); open complaints seen within an hour.
+
 ## Deploy and rollback
 
 - **Deploy:** push to `main`. Render builds, runs `alembic upgrade head`, then starts one worker. Check CI is
   green first.
-- **Rollback:** Render → Deploys → redeploy the previous commit. Migrations 0001–0005 only add things, so the
+- **Rollback:** Render → Deploys → redeploy the previous commit. Migrations 0001–0006 only add things, so the
   older code runs on the newer schema. Exception: code older than migration 0005 can create duplicate
   complaints again; the constraint will reject them with a 500 instead of a 409.
 - **A migration fails at start:** the instance never becomes healthy and Render keeps the previous deploy

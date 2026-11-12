@@ -18,7 +18,7 @@ here has had an external security review.
 
 | Attacker | Attack | Control in the code | What is left open |
 |---|---|---|---|
-| **Fraudster as payer** | Take over an account and pay out | Takeover floor blocks before PayPal is called; a blocked attempt doesn't make the device "known" | Evasion: wait 72 hours, stay under 3x the usual amount, or act from the victim's own device. Measured in `BENCHMARK.md`: 0% of patient takeovers are slowed, and 9.4% of held-out fraud overall |
+| **Fraudster as payer** | Take over an account and pay out | Takeover floor blocks before PayPal is called; a blocked attempt doesn't make the device "known" | Evasion: wait 72 hours, stay under 3x the usual amount, or act from the victim's own device. Measured in `BENCHMARK.md`: 0% of patient takeovers are slowed, and 0% of the current held-out fraud |
 | | Forge browser signals (device id, typing, fingerprint) | None that holds | All browser evidence is client-asserted. Needs device attestation |
 | | Forge the client address | `CF-Connecting-IP` preferred over `X-Forwarded-For` | Unverified on Render; if the edge passes a client's header through, per-address limits fail |
 | | Withhold evidence to lower the score | Missing data is listed in every decision | Missing evidence scores 0 by design |
@@ -30,11 +30,11 @@ here has had an external security review.
 | | XSS in the pages | No `innerHTML`; strict CSP with no inline script or style; `nosniff` | Not pen-tested |
 | | Forge a PayPal webhook | Signature verified with PayPal; unknown merchant quarantined; rate-limited | Depends on PayPal's verify endpoint being up |
 | **Stolen payer token** | Use the account | Only the hash is stored; logout invalidates it | Token is in `localStorage`, never expires on its own, and there is no password or second factor |
-| **Stolen reviewer key** | Approve refunds | Refunds only go to the original payer through PayPal; the amount must be typed; every action is in the audit trail under that reviewer's name; remove the entry from `REVIEWERS` to revoke | Refunds of $100 or more need a second, different reviewer, and keys expire on a set day. Below $100 one stolen key is enough; no IP restriction |
+| **Stolen reviewer key** | Approve refunds | Refunds only go to the original payer through PayPal; the amount must be typed; every action is in the audit trail under that reviewer's name; remove the entry from `REVIEWERS` to revoke | Refunds of $100 or more need a second, different reviewer, and keys expire on a set day. Below $100 one stolen key is enough; no IP restriction. Reviewers can't approve over $500 |
 | **Database read access** | Read decisions | Score, signals and evidence are AES-256-GCM encrypted | Payments, handles, IP hashes, device ids and complaint text are plaintext |
-| **Database write access** | Edit or delete decisions | Hash chain and HMAC detect edits, reorders and removals in the middle; a saved checkpoint detects a cut-off tail | Can roll the chain back to an older checkpoint if the checkpoint is also stored in the database. Can edit payments, complaints and the audit trail, which are not sealed |
+| **Database write access** | Edit or delete decisions | Hash chain and HMAC detect edits, reorders and removals in the middle; a decision moved to another payment fails verification (the payment id is inside the sealed evidence); a saved checkpoint detects a cut-off tail | Can roll the chain back to an older checkpoint if the checkpoint is also stored in the database. Can edit payments and complaints, which are not sealed. Edits to the audit log are detected by `/review/audit/verify` |
 | **Control of the host** | Everything | None | The sealing keys, PayPal credentials and owner hash are environment variables on the same host. Tamper-evidence does not hold against whoever controls the server. Needs an HSM or KMS and a separate signing service |
-| **Malicious or mistaken insider (owner key)** | Approve a wrong refund, read every case | Reviewer actions are recorded; large refunds need a second person | The owner key is shared, so "owner" is not one identifiable person. The action record is not sealed. The owner can read all complaint text |
+| **Malicious or mistaken insider (owner key)** | Approve a wrong refund, read every case | Reviewer actions are recorded; large refunds need a second person | The owner key is shared, so "owner" is not one identifiable person. The action record is hash-chained and signed, but with a key on the same host. The owner can read all complaint text |
 
 ## Not in scope, and not built
 

@@ -69,6 +69,8 @@ def base(r: random.Random) -> dict[str, Any]:
         "coaching_signs": r.random() < 0.03,  # people do get interrupted while paying
         "typing_deviation": r.random() < 0.05,
         "direct_to_new_payee_max_amount": False,
+        "recipient_fan_out_1h": r.choice([0, 0, 0, 1]),
+        "recipient_device_ring_size": 1,
     }
 
 
@@ -268,10 +270,9 @@ def fraud_device_farm(r):
 
 # ---------------------------------------------------------------- held-out scenarios
 #
-# Written on 2026-11-12 AFTER the rules were last changed, and scored once. Rule for this section: never
-# change a rule, threshold or floor because of a number in the held-out table. If a rule is changed for any
-# reason, these scenarios must be replaced with new ones the change wasn't fitted to. They exist to show how
-# the engine does on cases it wasn't written around; the tuning table above can't show that.
+# RETIRED held-out set (v1). It was scored once against ruleset 2026.11-2 (9.4% of its fraud slowed). The
+# rules then changed (graph signals RC8 and RC9, ruleset 2026.11-3), so by the rule further down these
+# scenarios moved into the tuning set and a new held-out set (v2) was written.
 
 
 def held_fraud_takeover_small_amounts(r):  # attacker drains in ordinary-sized payments
@@ -366,17 +367,111 @@ def held_legit_reset_then_big_payment(r):  # forgot password, reset it on the us
     return e
 
 
-HELD_LEGIT = [
+RETIRED_LEGIT = [
     (held_legit_first_rent, 40),
     (held_legit_traveller, 40),
     (held_legit_charity_appeal, 40),
     (held_legit_reset_then_big_payment, 40),
 ]
-HELD_FRAUD = [
+RETIRED_FRAUD = [
     (held_fraud_takeover_small_amounts, 40),
     (held_fraud_scam_from_new_phone, 40),
     (held_fraud_mule_aged_account, 40),
     (held_fraud_ring_member, 40),
+]
+
+# ---------------------------------------------------------------- held-out set v2
+#
+# Written on 2026-11-12 AFTER ruleset 2026.11-3 and scored once. Rule for this section: never change a rule,
+# threshold, floor or model because of a number in the held-out table. If anything is changed for any reason,
+# these scenarios move to the tuning set and new ones are written. In real use the held-out set would be
+# payments from a LATER time period than anything used for tuning or training; simulated data can only
+# imitate that by being written afterwards.
+
+
+def v2_fraud_sim_swap_takeover(r):  # SIM swapped, attacker on a new device, no credential change needed
+    e = on_new_device(to_new_payee(base(r), r))
+    e.update(amount_vs_norm_ratio=round(r.uniform(1.5, 2.9), 2))
+    if r.random() < 0.5:  # the telecom signal is only sometimes available
+        e["sim_swap_days_ago"] = r.randint(0, 5)
+    return e
+
+
+def v2_fraud_romance_repeat_payee(r):  # the "partner" has been paid twice before, so not a new payee
+    e = base(r)
+    e.update(
+        recipient_prior_payments=2,
+        recipient_relationship_days=r.randint(10, 40),
+        matches_recurring_pattern=False,
+        payment_reference=r.choice(["for your flight", "hospital bill", "customs for the parcel"]),
+        amount_vs_norm_ratio=round(r.uniform(2, 6), 2),
+        coaching_signs=r.random() < 0.5,
+    )
+    return e
+
+
+def v2_fraud_layering_mule(r):  # an old account that forwards money to several accounts within the hour
+    e = to_new_payee(base(r), r)
+    e.update(
+        recipient_account_age_days=r.randint(200, 900),
+        recipient_fan_out_1h=r.randint(3, 8),
+        recipient_passthrough_ratio_30m=round(r.uniform(0.5, 0.79), 2),
+        recipient_senders_7d=r.randint(3, 9),
+    )
+    return e
+
+
+def v2_fraud_fresh_ring_account(r):  # one of several new accounts run from the same device
+    e = to_new_payee(base(r), r)
+    e.update(recipient_account_age_days=r.randint(0, 6), recipient_device_ring_size=r.randint(2, 5))
+    return e
+
+
+def v2_legit_colleague_on_office_pc(r):  # payee uses a shared office computer with three colleagues
+    e = to_new_payee(base(r), r)
+    e.update(recipient_device_ring_size=4, accounts_on_device_or_ip_7d=r.randint(2, 4))
+    return e
+
+
+def v2_legit_shop_paying_suppliers(r):  # a busy shop that pays several suppliers soon after takings arrive
+    e = base(r)
+    e.update(
+        recipient_fan_out_1h=r.randint(4, 7),
+        recipient_senders_7d=r.randint(10, 60),
+        recipient_account_age_days=r.randint(300, 2500),
+    )
+    return e
+
+
+def v2_legit_gift_while_on_a_call(r):  # sending a birthday gift to someone new while chatting on the phone
+    e = to_new_payee(base(r), r)
+    e.update(payment_reference="happy birthday", active_call=True)
+    return e
+
+
+def v2_legit_student_new_phone_rent(r):  # new phone, first rent to a new landlord, far above usual spending
+    e = on_new_device(to_new_payee(base(r), r))
+    e.update(
+        amount_vs_norm_ratio=round(r.uniform(4, 15), 2),
+        amount_zscore_90d=round(r.uniform(3.2, 9), 2),
+        is_high_value=True,
+        direct_to_new_payee_max_amount=True,
+        payment_reference="rent",
+    )
+    return e
+
+
+HELD_LEGIT = [
+    (v2_legit_colleague_on_office_pc, 40),
+    (v2_legit_shop_paying_suppliers, 40),
+    (v2_legit_gift_while_on_a_call, 40),
+    (v2_legit_student_new_phone_rent, 40),
+]
+HELD_FRAUD = [
+    (v2_fraud_sim_swap_takeover, 40),
+    (v2_fraud_romance_repeat_payee, 40),
+    (v2_fraud_layering_mule, 40),
+    (v2_fraud_fresh_ring_account, 40),
 ]
 
 LEGIT = [
@@ -389,6 +484,7 @@ LEGIT = [
     (legit_pays_busy_new_seller, 40),
     (legit_scammy_reference, 25),
     (legit_shared_household, 25),
+    *RETIRED_LEGIT,
 ]
 FRAUD = [
     (fraud_takeover, 40),
@@ -401,20 +497,52 @@ FRAUD = [
     (fraud_known_bad_recipient, 20),
     (fraud_card_testing, 20),
     (fraud_device_farm, 20),
+    *RETIRED_FRAUD,
 ]
 SLOWED = {"step_up", "warn_and_delay", "hold_review", "block"}  # anything except a straight allow
 STOPPED = {"hold_review", "block"}  # no money moves without a reviewer
 
 
-def _score(r: random.Random, legit: list, fraud: list) -> dict[str, Any]:
-    rows, totals = [], {"legit": Counter(), "fraud": Counter()}
+FRAUD_SHARE = 0.005  # share of payments that are fraud in the "realistic mix" figures (an assumption)
+REVIEW_COST_USD = 4  # assumed cost of one human review, for the cost-per-case line
+
+
+def _amount(r: random.Random, label: str) -> float:
+    """Simulated payment size. Fraud is drawn larger, and with a long tail, as it is in practice."""
+    if label == "legit":
+        return round(r.choice([8, 15, 25, 40, 60, 90, 150, 400]) * r.uniform(0.7, 1.3), 2)
+    return round(r.choice([40, 90, 150, 300, 600, 900, 2500, 5000]) * r.uniform(0.7, 1.3), 2)
+
+
+def _score(r: random.Random, legit: list, fraud: list, model: dict | None = None) -> dict[str, Any]:
+    from app.risk import model as shadow
+
+    rows, t = [], {"legit": Counter(), "fraud": Counter()}
     for label, scenarios in (("legit", legit), ("fraud", fraud)):
         for make, n in scenarios:
-            actions = Counter(decide(make(r))["action"] for _ in range(n))
-            slowed, stopped = sum(actions[a] for a in SLOWED), sum(actions[a] for a in STOPPED)
-            rows.append((label, make.__name__, n, slowed, stopped))
-            totals[label].update(n=n, slowed=slowed, stopped=stopped)
-    lt, ft = totals["legit"], totals["fraud"]
+            slowed = stopped = m_slowed = either = 0
+            for _ in range(n):
+                decision = decide(make(r))
+                amount = _amount(r, label)
+                is_slowed, is_stopped = decision["action"] in SLOWED, decision["action"] in STOPPED
+                m_hit = bool(model) and shadow.predict(model, shadow.features_of(decision)) >= 0.5
+                slowed += is_slowed
+                stopped += is_stopped
+                m_slowed += m_hit
+                either += is_slowed or m_hit
+                t[label].update(
+                    n=1,
+                    slowed=is_slowed,
+                    stopped=is_stopped,
+                    model=m_hit,
+                    either=is_slowed or m_hit,
+                    money=amount,
+                    money_slowed=amount if is_slowed else 0,
+                )
+            rows.append((label, make.__name__, n, slowed, stopped, m_slowed, either))
+    lt, ft = t["legit"], t["fraud"]
+    review_load = 1000 * ((1 - FRAUD_SHARE) * lt["stopped"] / lt["n"] + FRAUD_SHARE * ft["stopped"] / ft["n"])
+    frauds_stopped_per_1000 = 1000 * FRAUD_SHARE * ft["stopped"] / ft["n"]
     return {
         "rows": rows,
         "legit": lt,
@@ -423,45 +551,80 @@ def _score(r: random.Random, legit: list, fraud: list) -> dict[str, Any]:
         "detection_stopped": ft["stopped"] / ft["n"],
         "false_positive_any": lt["slowed"] / lt["n"],
         "false_positive_stopped": lt["stopped"] / lt["n"],
+        "fraud_money_slowed": ft["money_slowed"] / ft["money"],
+        "fraud_money_missed_usd": ft["money"] - ft["money_slowed"],
+        "review_load_per_1000": review_load,
+        "review_cost_per_fraud_stopped": (
+            REVIEW_COST_USD * review_load / frauds_stopped_per_1000 if frauds_stopped_per_1000 else None
+        ),
+        "model_detection": ft["model"] / ft["n"],
+        "model_false_positive": lt["model"] / lt["n"],
+        "either_detection": ft["either"] / ft["n"],
+        "either_false_positive": lt["either"] / lt["n"],
     }
 
 
-def run() -> dict[str, Any]:
+def train_shadow_model() -> dict[str, Any]:
+    """The shadow model, trained on a DIFFERENT random draw of the tuning scenarios than the one scored."""
+    from app.risk import model as shadow
+
+    r = random.Random(SEED + 500)  # noqa: S311
+    rows = []
+    for label, scenarios in ((0, LEGIT), (1, FRAUD)):
+        for make, n in scenarios:
+            rows += [(shadow.features_of(decide(make(r))), label) for _ in range(n)]
+    return shadow.train(rows)
+
+
+def run(model: dict | None = None) -> dict[str, Any]:
     """The tuning set (rules have been adjusted with these numbers in view)."""
-    return _score(random.Random(SEED), LEGIT, FRAUD)  # noqa: S311 - a reproducible simulation, not security
+    return _score(random.Random(SEED), LEGIT, FRAUD, model)  # noqa: S311 - a reproducible simulation, not security
 
 
-def run_held_out() -> dict[str, Any]:
+def run_held_out(model: dict | None = None) -> dict[str, Any]:
     """The held-out set (see the rule above it: never tune against this)."""
-    return _score(random.Random(SEED + 1), HELD_LEGIT, HELD_FRAUD)  # noqa: S311
+    return _score(random.Random(SEED + 1), HELD_LEGIT, HELD_FRAUD, model)  # noqa: S311
 
 
-def _table(result: dict[str, Any], strip: str) -> list[str]:
-    pct = lambda x: f"{100 * x:.1f}%"  # noqa: E731
+def pct(x: float) -> str:
+    return f"{100 * x:.1f}%"
+
+
+def _title(name: str) -> str:
+    return name.removeprefix("v2_").removeprefix("held_").split("_", 1)[1].replace("_", " ")
+
+
+def _table(result: dict[str, Any]) -> list[str]:
     out = ["| Class | Scenario | Payments | Slowed | Stopped |", "|---|---|---|---|---|"]
-    for label, name, n, slowed, stopped in result["rows"]:
-        title = name.removeprefix(strip).split("_", 1)[1].replace("_", " ")
-        out.append(f"| {label} | {title} | {n} | {pct(slowed / n)} | {pct(stopped / n)} |")
+    for label, name, n, slowed, stopped, _, _ in result["rows"]:
+        out.append(f"| {label} | {_title(name)} | {n} | {pct(slowed / n)} | {pct(stopped / n)} |")
     lt, ft = result["legit"], result["fraud"]
+    cost = result["review_cost_per_fraud_stopped"]
     out += [
         "",
         f"- Fraud slowed or stopped (recall): **{pct(result['detection_any'])}** of {ft['n']}; "
         f"stopped outright: {pct(result['detection_stopped'])}",
+        f"- Fraud money slowed or stopped: **{pct(result['fraud_money_slowed'])}** of ${ft['money']:,.0f}; "
+        f"**${result['fraud_money_missed_usd']:,.0f} went straight through**",
         f"- Legitimate payments slowed (false-positive rate): **{pct(result['false_positive_any'])}** of {lt['n']}; "
         f"stopped outright: {pct(result['false_positive_stopped'])}",
+        f"- Review load at {pct(FRAUD_SHARE)} fraud: **{result['review_load_per_1000']:.1f} cases per 1,000 payments** "
+        "need a human"
+        + (f"; about ${cost:,.0f} of review per fraud case stopped (at ${REVIEW_COST_USD} a review)" if cost else ""),
     ]
     return out
 
 
-def report(result: dict[str, Any], held: dict[str, Any] | None = None) -> str:
-    held = held or run_held_out()
-    pct = lambda x: f"{100 * x:.1f}%"  # noqa: E731
-    missed = [
-        n.split("_", 1)[1].replace("_", " ")
-        for label, n, _, slowed, _ in result["rows"]
-        if label == "fraud" and not slowed
+def report() -> str:
+    model = train_shadow_model()
+    result, held = run(model), run_held_out(model)
+    missed = [_title(n) for label, n, _, slowed, *_ in result["rows"] if label == "fraud" and not slowed]
+    worst = max((r for r in [*result["rows"], *held["rows"]] if r[0] == "legit"), key=lambda r: r[4] / r[2])
+    compare = [
+        f"| {name} | {pct(x['detection_any'])} | {pct(x['model_detection'])} | {pct(x['either_detection'])} | "
+        f"{pct(x['false_positive_any'])} | {pct(x['model_false_positive'])} | {pct(x['either_false_positive'])} |"
+        for name, x in (("Tuning", result), ("Held-out v2", held))
     ]
-    worst = max((r for r in result["rows"] if r[0] == "legit"), key=lambda r: r[4] / r[2])
     return "\n".join(
         [
             f"# Benchmark: risk engine ruleset {RULESET_VERSION} on simulated payments (seed {SEED})",
@@ -472,37 +635,51 @@ def report(result: dict[str, Any], held: dict[str, Any] | None = None) -> str:
             "",
             "## What to take from this",
             "",
-            f"- The engine slows or stops **{pct(result['detection_any'])}** of the simulated fraud in the tuning set "
-            f"and **{pct(held['detection_any'])}** in the held-out set.",
-            f"- **It misses these fraud types completely (0% slowed):** {', '.join(missed)}. Each one stays just "
-            "under a threshold or uses data the app doesn't have.",
-            f"- **The cost to honest users is concentrated:** {pct(worst[4] / worst[2])} of "
-            f'"{worst[1].split("_", 1)[1].replace("_", " ")}" payments are stopped outright, about one in four '
-            "people who set up a new phone, reset their password and pay someone new. The overall "
-            f"false-positive rate ({pct(result['false_positive_any'])}) hides this because that group is small.",
-            "- No precision figure is given: it depends on the share of fraud in the mix, which here was chosen "
-            "by hand and is far higher than in real traffic.",
+            "- On fraud it was not written around (the held-out set), the engine slows or stops "
+            f"**{pct(held['detection_any'])}** of cases and **{pct(held['fraud_money_slowed'])}** of the money. "
+            f"On the tuning set the figures are {pct(result['detection_any'])} and "
+            f"{pct(result['fraud_money_slowed'])}. The gap between the two is the main finding.",
+            f"- **It misses these tuning-set fraud types completely (0% slowed):** {', '.join(missed)}.",
+            f'- **The cost to honest users is concentrated:** {pct(worst[4] / worst[2])} of "{_title(worst[1])}" '
+            "payments are stopped outright. Overall false-positive rates hide this because such groups are small.",
+            f"- **Review load:** {held['review_load_per_1000']:.1f} cases per 1,000 payments on the held-out mix. "
+            "Human review capacity, not recall, is what limits a real system.",
+            "- No precision figure is given: it depends on the share of fraud in the mix, which is an assumption "
+            f"here ({pct(FRAUD_SHARE)} for the review-load lines).",
+            "",
+            "## Held-out set (v2)",
+            "",
+            "Written after the last rule change and scored once. No rule, threshold, floor or model may be changed "
+            "because of this table; if anything changes, these scenarios move to the tuning set and new ones are "
+            "written. The first held-out set (v1, 9.4% recall on ruleset 2026.11-2) was retired that way when the "
+            "graph signals were added.",
+            "",
+            *_table(held),
+            "",
+            "## Rules compared with the shadow model",
+            "",
+            'A logistic regression over "which signals fired", trained on a separate random draw of the tuning '
+            "scenarios. It runs in shadow mode in the app and decides nothing. **Trained on simulated data, it can "
+            "only see what the rules already extract, so it mostly learns the rules back.** The comparison shows "
+            "the method, not a gain.",
+            "",
+            "| Set | Fraud flagged: rules | model | either | Legit flagged: rules | model | either |",
+            "|---|---|---|---|---|---|---|",
+            *compare,
             "",
             "## Tuning set",
             "",
-            "Rules have been changed with these numbers in view, so they flatter the engine. One floor "
-            '(`CONFIRMED_FRAUD_RECIPIENT`) was added because "known bad recipient" scored 15% here; its 100% '
-            "now is the rule fitted to its own test, not evidence that the rule generalises.",
+            "Rules have been changed with these numbers in view, so they flatter the engine. It includes the retired "
+            'held-out v1 scenarios. One floor (`CONFIRMED_FRAUD_RECIPIENT`) was added because "known bad recipient" '
+            "scored 15% here; its 100% now is the rule fitted to its own test.",
             "",
-            *_table(result, ""),
-            "",
-            "## Held-out set",
-            "",
-            "Written after the last rule change and scored once. No rule, threshold or floor may be changed "
-            "because of this table; if the rules change, these scenarios are replaced.",
-            "",
-            *_table(held, "held_"),
+            *_table(result),
         ]
     )
 
 
 if __name__ == "__main__":
-    text = report(run(), run_held_out())
+    text = report()
     print(text)
     if "--write" in sys.argv:
         Path(__file__).resolve().parent.parent.joinpath("BENCHMARK.md").write_text(text + "\n", encoding="utf-8")

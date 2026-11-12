@@ -98,7 +98,8 @@ def world(monkeypatch):
         with db.get_engine().begin() as conn:
             conn.execute(
                 text(
-                    "TRUNCATE payment_events, app_complaints, risk_decisions, app_payments, app_users "
+                    "TRUNCATE audit_log, shared_devices, payment_events, app_complaints, risk_decisions, "
+                    "app_payments, app_users "
                     "RESTART IDENTITY CASCADE"
                 )
             )
@@ -1369,12 +1370,14 @@ def test_labels_report_what_the_engine_decided_on_reviewer_confirmed_outcomes(wo
     ]
     world.post(f"/review/complaints/{cid2}/decline", headers=OWNER)
     out = world.get("/risk/labels", headers=OWNER).json()
-    assert (out["labelled"], out["fraud"], out["legitimate"]) == (2, 1, 1)
+    assert (out["labelled"], out["fraud"], out["not_upheld"]) == (2, 1, 1)
     assert out["fraud_the_engine_had_slowed"] == 1 and out["fraud_the_engine_allowed"] == 0
-    assert out["legitimate_the_engine_had_slowed"] == 0 and "Too few" in out["note"]
+    assert out["fraud_amount_total"] == "45.00" and out["fraud_amount_the_engine_allowed"] == "0.00"
+    assert out["not_upheld_the_engine_had_slowed"] == 0 and "Too few" in out["note"]
+    assert "NOT that the payment was proven legitimate" in out["label_meaning"]
     by_id = {r["payment_id"]: r for r in out["rows"]}
     assert by_id[pid]["label"] == "fraud" and "C3_SCAM_REFERENCE" in by_id[pid]["signals_fired"]
-    assert by_id[ok]["label"] == "legitimate" and by_id[ok]["action"] == "allow"
+    assert by_id[ok]["label"] == "not_upheld" and by_id[ok]["action"] == "allow"
     assert world.get("/risk/labels", headers={"X-API-Key": "x"}).status_code == 401
 
 
@@ -1397,3 +1400,343 @@ def test_reconcile_flags_a_completed_order_with_no_capture_and_log_keys_cannot_b
         payapp.add_event(s, pid, "system", "real_event", {"event": "forged", "actor": "forged", "payment_id": -1})
     line = json.loads(caplog.records[-1].message)
     assert (line["event"], line["actor"], line["payment_id"]) == ("real_event", "system", pid)
+
+
+# --------------------------------------------------------------------------- sealed audit, flags, graph signals
+
+
+def confirm_carol_as_fraud(world):
+    alice, pid = captured_scam_payment(world)
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    assert (
+        world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json={"confirm_amount": "45.00"}).status_code
+        == 200
+    )
+    return alice, pid
+
+
+def test_audit_chain_records_actions_and_case_reads_and_detects_tampering(world) -> None:
+    alice, pid = confirm_carol_as_fraud(world)
+    world.get(f"/review/payments/{pid}", headers=OWNER)
+    actions = world.get("/review/audit", headers=OWNER).json()
+    assert actions["sealed"] is True and [a["action"] for a in actions["actions"]] == ["refund_approved", "released"]
+    with_reads = world.get("/review/audit", params={"include_reads": True}, headers=OWNER).json()["actions"]
+    assert with_reads[0]["action"] == "case_read" and with_reads[0]["subject"] == f"payment:{pid}"
+    assert world.get("/review/audit/verify", headers=OWNER).json() == {
+        "ok": True,
+        "records": 3,
+        "first_bad_index": None,
+    }
+    count = world.get("/risk/checkpoint", headers=OWNER).json()["audit_count"]
+    assert count == 3
+    with db.session_scope() as s:  # someone with database access rewrites who approved the refund
+        s.execute(text("UPDATE audit_log SET actor = 'somebody_else' WHERE action = 'refund_approved'"))
+    assert world.get("/review/audit/verify", headers=OWNER).json()["first_bad_index"] == 1
+    with db.session_scope() as s:
+        s.execute(text("UPDATE audit_log SET actor = 'owner' WHERE action = 'refund_approved'"))
+        s.execute(text("DELETE FROM audit_log WHERE id = (SELECT max(id) FROM audit_log)"))
+    assert world.get("/review/audit/verify", headers=OWNER).json()["ok"] is True  # a cut-off tail needs the count
+    cut = world.get("/review/audit/verify", params={"expected_count": count}, headers=OWNER).json()
+    assert cut["ok"] is False and cut["records"] == 2
+    assert world.get("/review/audit/verify").status_code == 401
+
+
+def test_clearing_a_fraud_flag_is_owner_only_audited_and_a_new_complaint_flags_again(world, monkeypatch) -> None:
+    asha, _ = reviewer_env(monkeypatch)
+    confirm_carol_as_fraud(world)
+    dave = signup(world, "dave")
+    assert pay(world, dave, "carol", 10, name="Carol").json()["action"] == "hold_review"
+    assert world.post("/risk/fraud-flag/carol/clear", headers=asha, json={"reason": "demo retake"}).status_code == 401
+    assert world.post("/risk/fraud-flag/carol/clear", headers=OWNER, json={"reason": "x"}).status_code == 422
+    world.now["t"] = T0 + timedelta(minutes=5)
+    assert world.post("/risk/fraud-flag/carol/clear", headers=OWNER, json={"reason": "demo retake"}).status_code == 200
+    again = pay(world, dave, "carol", 11, name="Carol").json()
+    assert again["action"] == "allow" and "CONFIRMED_FRAUD_RECIPIENT" not in again["decision"]["floors_triggered"]
+    assert "RC4_RECIPIENT_PRIOR_COMPLAINTS" not in again["decision"]["signals_fired"]
+    assert "E1_ON_NEGATIVE_LIST" not in again["decision"]["signals_fired"] and again["decision"]["score"] < 12
+    top = world.get("/review/audit", headers=OWNER).json()["actions"][0]
+    assert (top["action"], top["subject"], top["reason"]) == ("fraud_flag_cleared", "account:carol", "demo retake")
+    with db.session_scope() as s:
+        assert s.scalar(select(func.count(AppComplaint.id))) == 1  # the complaint and refund are kept
+    # a complaint confirmed after the clearing flags the account again
+    world.now["t"] = T0 + timedelta(minutes=10)
+    world.post(f"/app/payments/{again['payment_id']}/capture", headers=dave)
+    cid = world.post(f"/app/payments/{again['payment_id']}/complaint", headers=dave, json={"claim": "scam"}).json()[
+        "complaint_id"
+    ]
+    world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json={"confirm_amount": "11.00"})
+    assert pay(world, signup(world, "erin"), "carol", 12, name="Carol").json()["action"] == "hold_review"
+    assert world.post("/risk/fraud-flag/nobody/clear", headers=OWNER, json={"reason": "demo retake"}).status_code == 404
+
+
+def test_graph_signals_are_scored_old_device_links_expire_and_allowed_devices_link_nobody(world) -> None:
+    make_user("mule", T0 - timedelta(days=300))
+    for i in range(4):
+        make_user(f"out{i}", T0 - timedelta(days=200))
+    make_user("feeder", T0 - timedelta(days=200))
+    live_payment("feeder", "mule", 400, T0 - timedelta(minutes=40), device="1" * 32)
+    for i in range(4):
+        live_payment("mule", f"out{i}", 90, T0 - timedelta(minutes=30 - i), device="e" * 32)
+    for name in ("ring_a", "ring_b"):
+        make_user(name, T0 - timedelta(days=2))
+        live_payment(name, "out0", 1, T0 - timedelta(minutes=5), device="e" * 32, status="blocked")
+    payer = signup(world, "payer")
+    r = pay(world, payer, "mule", 10, name="Mule").json()["decision"]["signals_fired"]
+    assert "RC8_FAN_OUT_AFTER_RECEIPT" in r and "RC9_DEVICE_RING" in r
+    assert (
+        "RC8_FAN_OUT_AFTER_RECEIPT"
+        not in pay(world, payer, "out1", 10, name="Out1").json()["decision"]["signals_fired"]
+    )
+    # the owner marks the device as a legitimately shared one: the ring disappears
+    assert (
+        world.post(
+            "/risk/shared-devices", headers=OWNER, json={"device_id": "e" * 32, "note": "front desk PC"}
+        ).status_code
+        == 200
+    )
+    r = pay(world, payer, "mule", 11, name="Mule").json()["decision"]["signals_fired"]
+    assert "RC9_DEVICE_RING" not in r and "RC8_FAN_OUT_AFTER_RECEIPT" in r
+    assert world.get("/risk/graph/mule", headers=OWNER).json()["shared_devices"] == []
+    assert world.post("/risk/shared-devices", json={"device_id": "e" * 32, "note": "front desk PC"}).status_code == 401
+    # device use older than 14 days links nobody
+    make_user("old_a", T0 - timedelta(days=100))
+    make_user("old_b", T0 - timedelta(days=100))
+    live_payment("old_a", "out0", 1, T0 - timedelta(days=20), device="d" * 32, status="cancelled")
+    live_payment("old_b", "out0", 1, T0 - timedelta(days=1), device="d" * 32, status="cancelled")
+    assert world.get("/risk/graph/old_b", headers=OWNER).json()["shared_devices"] == []
+
+
+def test_a_large_refund_with_no_named_reviewer_is_refused_up_front_and_nothing_is_recorded(world, monkeypatch) -> None:
+    monkeypatch.delenv("REVIEWERS", raising=False)
+    pid, cid = big_captured_payment(world)
+    r = world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json={"confirm_amount": "150.00"})
+    assert r.status_code == 409 and "Nothing was recorded" in r.json()["detail"]
+    with db.session_scope() as s:
+        c = s.get(AppComplaint, cid)
+        assert c.status != "awaiting_second_approval" and "_first_approver" not in c.claims  # not stuck
+    assert world.get("/review/audit", headers=OWNER).json()["actions"] == []
+    assert world.post(f"/review/complaints/{cid}/decline", headers=OWNER).status_code == 200
+
+
+def test_named_reviewers_cannot_approve_above_their_limit_and_the_owner_key_can_expire(world, monkeypatch) -> None:
+    from datetime import date
+
+    from app import auth
+
+    asha, ravi = reviewer_env(monkeypatch)
+    pid, cid = big_captured_payment(world, "600.00")
+    body = {"confirm_amount": "600.00"}
+    # over the reviewer limit the owner must be ONE of the two approvers, in either order
+    first = world.post(f"/review/complaints/{cid}/approve", headers=asha, json=body)
+    assert first.json()["status"] == "awaiting_second_approval"
+    two_reviewers = world.post(f"/review/complaints/{cid}/approve", headers=ravi, json=body)
+    assert two_reviewers.status_code == 403 and "need the owner" in two_reviewers.json()["detail"]
+    assert not world.paypal.called("refund_capture")
+    done = world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json=body)
+    assert done.status_code == 200 and done.json()["status"] == "refunded"
+    monkeypatch.setattr(auth, "today", lambda: date(2026, 11, 12))
+    monkeypatch.setenv("OWNER_KEY_EXPIRES", "2026-11-12")
+    assert world.get("/metrics", headers=OWNER).status_code == 200  # last valid day
+    monkeypatch.setenv("OWNER_KEY_EXPIRES", "2026-11-11")
+    assert (
+        world.get("/metrics", headers=OWNER).status_code == 401
+        and world.get("/review/queue", headers=OWNER).status_code == 401
+    )
+    assert world.get("/review/queue", headers=asha).status_code == 200  # reviewers are unaffected
+    monkeypatch.setenv("OWNER_KEY_EXPIRES", "soon")
+    assert world.get("/metrics", headers=OWNER).status_code == 401  # unreadable date = refused
+
+
+def test_metrics_raise_alerts_and_report_scoring_time_and_review_load(world, monkeypatch) -> None:
+    alice = regular_payer(world)
+    assert world.get("/metrics", headers=OWNER).json()["alerts"] == []
+    pid = pay(world, alice, "bob", 20, name="Bob").json()["payment_id"]
+    world.post(f"/app/payments/{pid}/capture", headers=alice)
+    world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"})
+    world.paypal.fail.add("create_order")
+    pay(world, alice, "bob", 21, name="Bob")
+    world.now["t"] = T0 + timedelta(hours=2)
+    m = world.get("/metrics", headers=OWNER).json()
+    assert any("PayPal call(s) failed" in a for a in m["alerts"])
+    assert any("oldest open complaint has waited 120 minutes" in a for a in m["alerts"])
+    assert isinstance(m["scoring_ms_p95_24h"], int) and m["scoring_target_ms"] == 800
+    assert m["review_load_per_1000_payments_24h"] == 500.0  # 1 complaint over 2 scored payments
+    from app.config import get_settings
+
+    real = get_settings()
+    monkeypatch.setattr(payapp, "get_settings", lambda: type(real)(**{**real.__dict__, "scoring_target_ms": -1}))
+    assert any("scoring p95" in a for a in world.get("/metrics", headers=OWNER).json()["alerts"])
+
+
+def test_shadow_model_is_recorded_beside_the_decision_and_never_changes_it(world, monkeypatch, tmp_path) -> None:
+    import json
+
+    from app.risk import model as shadow
+
+    alice = regular_payer(world)
+    before = pay(world, alice, "bob", 20, name="Bob").json()
+    # a deliberately absurd model: everything is fraud
+    path = tmp_path / "model.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": "test-always-fraud",
+                "features": list(shadow.FEATURES),
+                "weights": [0.0] * len(shadow.FEATURES),
+                "bias": 9.0,
+                "threshold": 0.5,
+            }
+        )
+    )
+    monkeypatch.setenv("RISK_MODEL_PATH", str(path))
+    after = pay(world, alice, "bob", 20, name="Bob").json()
+    assert after["action"] == before["action"] == "allow" and after["decision"]["score"] == before["decision"]["score"]
+    with db.session_scope() as s:
+        snap = service.open_decision(s.scalar(select(RiskDecision).order_by(RiskDecision.id.desc())))
+    assert snap["evidence"]["shadow_model"] == {"version": "test-always-fraud", "p_fraud": 0.9999, "would_slow": True}
+    out = world.get("/risk/shadow", headers=OWNER).json()
+    assert (
+        out["decisions_scored_by_model"] == 1
+        and out["disagreed"] == 1
+        and out["model_versions"] == ["test-always-fraud"]
+    )
+    assert out["disagreements"][0]["rules"] == "allow" and out["disagreements"][0]["reviewer_outcome"] is None
+    path.write_text("{ not json")  # a broken model file must never break a payment
+    assert pay(world, alice, "bob", 20, name="Bob").status_code == 200
+    assert world.get("/risk/shadow").status_code == 401
+
+
+def test_retention_dry_run_changes_nothing_and_confirm_clears_old_personal_details(world) -> None:
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("retention", Path("scripts/retention.py"))
+    retention = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(retention)
+    alice, pid = captured_scam_payment(world)
+    world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam", "text": "private words"})
+    with db.session_scope() as s:
+        s.get(AppPayment, pid).created_at = datetime.now(timezone.utc) - timedelta(days=400)
+    assert retention.run(180, confirm=False) == {"payments": 1, "complaints": 1}
+    with db.session_scope() as s:
+        assert s.get(AppPayment, pid).device_id == DEV_A and s.scalar(select(AppComplaint)).text == "private words"
+    assert retention.run(180, confirm=True) == {"payments": 1, "complaints": 1}
+    with db.session_scope() as s:
+        p, c = s.get(AppPayment, pid), s.scalar(select(AppComplaint))
+        assert (p.device_id, p.ip_hash, p.client, c.text) == (None, None, {}, "")
+        assert p.amount == Decimal("45.00") and c.result["consistency_score"] >= 0 and "_priority" in c.claims
+    assert world.post("/risk/verify", headers=OWNER, json={}).json()["ok"] is True  # sealed decisions untouched
+    assert world.get("/review/audit", headers=OWNER).json()["actions"][0]["action"] == "retention_applied"
+    assert retention.run(180, confirm=True) == {"payments": 0, "complaints": 0}
+
+
+# --------------------------------------------------------------------------- re-review findings F-01 to F-15
+
+
+def test_f02_a_600_dollar_refund_completes_with_owner_first_then_a_reviewer(world, monkeypatch) -> None:
+    asha, _ = reviewer_env(monkeypatch)
+    pid, cid = big_captured_payment(world, "600.00")
+    body = {"confirm_amount": "600.00"}
+    assert (
+        world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json=body).json()["status"]
+        == "awaiting_second_approval"
+    )
+    assert world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json=body).status_code == 409
+    done = world.post(f"/review/complaints/{cid}/approve", headers=asha, json=body)
+    assert done.status_code == 200 and done.json()["status"] == "refunded"
+    assert world.paypal.called("refund_capture")[0][2] == "600.00"
+
+
+def test_f01_a_forged_simulated_false_cannot_switch_off_a_real_fraud_signal(world) -> None:
+    confirm_carol_as_fraud(world)
+    dave = signup(world, "dave")
+    honest = pay(world, dave, "carol", 10, name="Carol").json()
+    assert honest["action"] == "hold_review"
+    for forged in (
+        {"on_negative_list": False},
+        {"on_negative_list": False, "active_call": False, "sim_swap_days_ago": 300},
+    ):
+        r = pay(world, dave, "carol", 10, name="Carol", sim=forged).json()
+        assert r["action"] == "hold_review" and "CONFIRMED_FRAUD_RECIPIENT" in r["decision"]["floors_triggered"], forged
+        assert "on_negative_list" not in r["decision"]["simulated_fields"]
+    with db.session_scope() as s:
+        snap = service.open_decision(s.scalar(select(RiskDecision).order_by(RiskDecision.id.desc())))
+    assert snap["evidence"]["on_negative_list"] is True and "active_call" not in snap["evidence"]
+    from app.risk.evidence import SIMULATABLE, sanitize_simulated
+
+    assert sanitize_simulated({k: False for k in SIMULATABLE}) == {}  # no simulated value can remove risk
+
+
+def test_f03_recent_attempts_still_count_after_a_thousand_old_ones(world) -> None:
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    with db.session_scope() as s:
+        a, b = uid("alice"), uid("bob")
+        s.add_all(
+            AppPayment(
+                payer_id=a,
+                payee_id=b,
+                amount=Decimal("5.00"),
+                status="cancelled",
+                device_id=DEV_A,
+                ip_hash="ip",
+                created_at=T0 - timedelta(days=30, minutes=i),
+                seeded=True,
+            )
+            for i in range(1001)
+        )
+    for _ in range(2):
+        add_payment("alice", "bob", "0.60", T0 - timedelta(minutes=3), status="cancelled")
+    r = pay(world, alice, "bob", "0.60").json()
+    assert "F1_CARD_TESTING" in r["decision"]["signals_fired"]
+
+
+def test_f04_a_decision_moved_to_another_payment_fails_verification_and_cannot_be_used(world) -> None:
+    alice = regular_payer(world)
+    p1 = pay(world, alice, "bob", 20, name="Bob").json()["payment_id"]
+    p2 = pay(world, alice, "bob", 21, name="Bob").json()["payment_id"]
+    assert world.post("/risk/verify", headers=OWNER, json={}).json()["ok"] is True
+    with db.get_engine().begin() as c:  # a database administrator swaps the two decisions
+        c.execute(text("ALTER TABLE risk_decisions DROP CONSTRAINT uq_risk_decisions_payment_id"))
+        c.execute(
+            text("UPDATE risk_decisions SET payment_id = CASE payment_id WHEN :a THEN :b ELSE :a END"),
+            {"a": p1, "b": p2},
+        )
+    try:
+        out = world.post("/risk/verify", headers=OWNER, json={}).json()
+        assert out["ok"] is False and out["first_bad_index"] == 0 and "different payment" in out["note"]
+        assert "could not open" in world.get(f"/review/payments/{p1}", headers=OWNER).json()["decision"]["error"]
+        world.post(f"/app/payments/{p1}/capture", headers=alice)
+        assert world.post(f"/app/payments/{p1}/complaint", headers=alice, json={"claim": "scam"}).status_code == 500
+        with db.session_scope() as s:
+            assert s.scalar(select(func.count(AppComplaint.id))) == 0  # no complaint judged on the wrong record
+        assert world.get("/risk/scam-library", headers=OWNER).status_code == 200  # F-15: reports survive bad records
+        assert world.get(f"/risk/gap/{p1}", params={"typology": "takeover"}, headers=OWNER).status_code == 409
+    finally:
+        with db.get_engine().begin() as c:
+            c.execute(
+                text("UPDATE risk_decisions SET payment_id = CASE payment_id WHEN :a THEN :b ELSE :a END"),
+                {"a": p1, "b": p2},
+            )
+            c.execute(
+                text("ALTER TABLE risk_decisions ADD CONSTRAINT uq_risk_decisions_payment_id UNIQUE (payment_id)")
+            )
+
+
+def test_f06_exotic_amount_strings_are_a_422_never_a_500(world) -> None:
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    for bad in ("9E+9999999", "1e2", "NaN", "Infinity", "-5", "+5", "5.", ".5", "1,000", " ", "٥", "0x10", "5.001"):
+        assert pay(world, alice, "bob", bad).status_code == 422, bad
+    assert pay(world, alice, "bob", "5").status_code == 200 and pay(world, alice, "bob", "5.5").status_code == 200
+
+
+def test_f09_cancel_cannot_overwrite_a_capture_in_progress(world) -> None:
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    pid = pay(world, alice, "bob", "10.00").json()["payment_id"]
+    with db.session_scope() as s:
+        s.get(AppPayment, pid).status = "capturing"
+    assert world.post(f"/app/payments/{pid}/cancel", headers=alice).status_code == 409
+    with db.session_scope() as s:
+        assert s.get(AppPayment, pid).status == "capturing"
+        assert not s.scalar(
+            select(PaymentEvent.id).where(PaymentEvent.payment_id == pid, PaymentEvent.action == "cancelled")
+        )

@@ -8,3 +8,5 @@ spike_logs/
 .ruff_cache/
 node_modules/
 *.zip
+model.json
+labels.json

@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-RULESET_VERSION = "2026.11-2"
+RULESET_VERSION = "2026.11-3"
 TIER_POINTS = {"LOW": 3, "MED": 7, "HIGH": 12}
 CATEGORY_CAPS = {
     "velocity": 20,
@@ -172,6 +172,9 @@ SIGNALS: tuple[Signal, ...] = (
     _flag("RC5_PAYEE_NAME_MISMATCH", "recipient", "MED", "payee_name_mismatch"),
     _flag("RC6_HIGH_RISK_CASH_OUT", "recipient", "MED", "recipient_high_risk_cashout", "ledger"),
     _over("RC7_INBOUND_ABOVE_PROFILE", "recipient", "MED", "recipient_inbound_vs_profile_ratio", 5, "ledger"),
+    # From the payments graph (risk/graph.py). Added in ruleset 2026.11-3.
+    _over("RC8_FAN_OUT_AFTER_RECEIPT", "recipient", "HIGH", "recipient_fan_out_1h", 3, "ledger"),
+    _over("RC9_DEVICE_RING", "recipient", "MED", "recipient_device_ring_size", 2, "ledger"),
     # 7. Behavioural biometrics (deviation flags only; raw keystrokes are never stored)
     _flag("B1_TYPING_DEVIATION", "behaviour", "MED", "typing_deviation"),
     _flag("B2_COACHING_SIGNS", "behaviour", "MED", "coaching_signs"),

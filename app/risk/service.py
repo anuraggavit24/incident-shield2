@@ -68,7 +68,12 @@ def open_decision(row: RiskDecision) -> dict[str, Any]:
     ring = keyring()
     if ring is None:
         raise SnapshotError("risk keys are not configured")
-    return open_snapshot(_record(row), ring["enc"])
+    snap = open_snapshot(_record(row), ring["enc"])
+    # The payment id is inside the encrypted, signed evidence. If the row now points at another payment,
+    # someone moved it: refuse to treat it as that payment's decision.
+    if snap["evidence"].get("txn_id") != row.payment_id:
+        raise SnapshotError("this decision was sealed for a different payment")
+    return snap
 
 
 def decision_for(session: Session, payment_id: int) -> RiskDecision | None:
@@ -92,8 +97,21 @@ def verify(session: Session, saved_checkpoint: dict[str, Any] | None) -> dict[st
     ring = keyring()
     if ring is None:
         raise SnapshotError("risk keys are not configured")
-    records = [_record(r) for r in all_rows(session)]
+    rows = all_rows(session)
+    records = [_record(r) for r in rows]
     ok, bad = verify_chain(records, ring["sign"], saved_checkpoint)
+    if ok:  # the chain is intact; now check each record still belongs to the payment it was sealed for
+        for index, row in enumerate(rows):
+            try:
+                open_decision(row)
+            except SnapshotError:
+                return {
+                    "ok": False,
+                    "records": len(records),
+                    "first_bad_index": index,
+                    "checkpoint_used": saved_checkpoint is not None,
+                    "note": "a record is attached to a different payment than it was sealed for, or can't be opened",
+                }
     return {
         "ok": ok,
         "records": len(records),

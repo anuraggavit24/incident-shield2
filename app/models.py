@@ -141,6 +141,9 @@ class AppUser(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     credentials_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     credentials_changed_device: Mapped[str | None] = mapped_column(String(64))
+    # Set when the owner clears a fraud flag: confirmed complaints filed before this moment no longer count
+    # against the account. The complaints themselves are kept.
+    fraud_cleared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Demo data only: marks users and payments inserted by the seed script, not made through the app.
     seeded: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
@@ -219,3 +222,33 @@ class PaymentEvent(Base):
     actor: Mapped[str] = mapped_column(String(16))  # payer | system | reviewer | paypal
     action: Mapped[str] = mapped_column(String(48))
     details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class AuditLog(Base):
+    """Who did or read what. Hash-chained and signed like the risk decisions, so an edit, a reorder or a
+    removal in the middle is detectable. Contents are readable (not encrypted): names, actions, ids."""
+
+    __tablename__ = "audit_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    at: Mapped[str] = mapped_column(String(40))  # ISO text, stored exactly as hashed
+    actor: Mapped[str] = mapped_column(String(32), index=True)
+    action: Mapped[str] = mapped_column(String(48), index=True)
+    subject: Mapped[str] = mapped_column(String(80), default="")
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    key_id: Mapped[str] = mapped_column(String(16))
+    prev_hash: Mapped[str] = mapped_column(String(64))
+    record_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    signature: Mapped[str] = mapped_column(String(64))
+
+
+class SharedDevice(Base):
+    """A device the owner has marked as legitimately shared (a household tablet, an office PC). The payments
+    graph ignores it when linking accounts."""
+
+    __tablename__ = "shared_devices"
+
+    device_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    note: Mapped[str] = mapped_column(String(140), default="")
+    added_by: Mapped[str] = mapped_column(String(32))
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

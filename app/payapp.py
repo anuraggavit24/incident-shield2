@@ -21,7 +21,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 import httpx
@@ -31,12 +31,12 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import db
-from .auth import require_owner, require_reviewer
+from . import audit, db
+from .auth import require_owner, require_reviewer, reviewers
 from .config import get_settings
-from .models import AppComplaint, AppPayment, AppUser, PaymentEvent, RiskDecision
+from .models import AppComplaint, AppPayment, AppUser, PaymentEvent, RiskDecision, SharedDevice
 from .paypal_client import PayPalClient, PayPalError
-from .risk import service
+from .risk import model, service
 from .risk.brief import write_brief
 from .risk.claims import extract_claims, queue_priority
 from .risk.complaint import consistency
@@ -51,6 +51,7 @@ log = logging.getLogger("incident_shield.payapp")
 router = APIRouter()
 
 HANDLE = re.compile(r"^[a-z0-9_]{3,24}$")
+AMOUNT = re.compile(r"^[0-9]{1,6}(\.[0-9]{1,2})?$")  # ASCII digits only; \d would accept other scripts
 DEVICE_ID = re.compile(r"^[A-Za-z0-9-]{16,64}$")
 MIN_AMOUNT, MAX_AMOUNT = Decimal("0.50"), Decimal("1000.00")
 PAYPAL_DOWN = (PayPalError, httpx.HTTPError)  # a refusal from PayPal, or PayPal unreachable
@@ -58,6 +59,7 @@ ATTEMPTS_PER_HOUR = 60
 COMPLAINTS_PER_DAY = 5
 OPEN_COMPLAINTS = ("fast_tracked", "in_review", "manual_review", "awaiting_second_approval")
 STALE_CAPTURE_SECONDS = 60
+CANCELLABLE = ("awaiting_approval", "awaiting_confirmation", "delayed")
 
 
 def utcnow() -> datetime:
@@ -155,12 +157,13 @@ def _paypal(request: Request) -> PayPalClient:
 
 
 def parse_amount(raw: str) -> Decimal:
+    raw = raw.strip()
+    if not AMOUNT.fullmatch(raw):  # plain digits only: no exponents, signs, NaN or Infinity
+        raise HTTPException(status_code=422, detail="amount must be a number with at most 2 decimals")
     try:
-        value = Decimal(raw.strip())
+        value = Decimal(raw)
     except InvalidOperation:
         raise HTTPException(status_code=422, detail="amount must be a number") from None
-    if not value.is_finite() or value != value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP):
-        raise HTTPException(status_code=422, detail="amount must have at most 2 decimals")
     if not MIN_AMOUNT <= value <= MAX_AMOUNT:
         raise HTTPException(status_code=422, detail=f"amount must be between {MIN_AMOUNT} and {MAX_AMOUNT}")
     return value
@@ -214,6 +217,11 @@ def add_event(
     # never tokens, keys or complaint text.
     # Fixed keys go last so a details key can never replace them.
     log.info(json.dumps({**(details or {}), "event": action, "payment_id": payment_id, "actor": actor}, default=str))
+    if actor == "reviewer":  # reviewer actions also go into the sealed audit chain, in the same transaction
+        who = str((details or {}).get("by", "unknown"))
+        audit.record(
+            session, who, action, f"payment:{payment_id}", {**(details or {}), "payment_id": payment_id}, utcnow()
+        )
 
 
 def _decision_summary(decision: dict[str, Any], simulated: list[str]) -> dict[str, Any]:
@@ -419,6 +427,7 @@ def demo_history(body: CredentialsBody, request: Request, user_id: int = Depends
 def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(current_payer)) -> dict[str, Any]:
     """Score the attempt, seal the decision, then act on the band. No money moves unless it is cleared."""
     _ring_or_503()
+    started = time.monotonic()
     settings = get_settings()
     amount = parse_amount(body.amount)
     if not DEVICE_ID.fullmatch(body.device_id):
@@ -468,6 +477,10 @@ def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(c
         if ref_read["flagged"]:
             evidence["reference_flagged_by_ai"] = True
         decision = decide(evidence)
+        shadow = model.shadow_score(decision)  # recorded beside the decision; never changes it
+        if shadow is not None:
+            evidence["shadow_model"] = shadow
+        scoring_ms = int((time.monotonic() - started) * 1000)
         action = decision["action"]
         status = {
             "allow": "scored",
@@ -499,7 +512,13 @@ def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(c
             payment.id,
             "system",
             "scored",
-            {"score": decision["score"], "band": decision["band"], "action": action, "decision_id": sealed.id},
+            {
+                "score": decision["score"],
+                "band": decision["band"],
+                "action": action,
+                "decision_id": sealed.id,
+                "scoring_ms": scoring_ms,
+            },
         )
         payment_id = payment.id
         summary = _decision_summary(decision, evidence.get("simulated_fields", []))
@@ -683,10 +702,16 @@ def cancel_payment(payment_id: int, user_id: int = Depends(current_payer)) -> di
         p = session.get(AppPayment, payment_id)
         if p is None or p.payer_id != user_id:
             raise HTTPException(status_code=404, detail="payment not found")
-        if p.status not in ("awaiting_approval", "awaiting_confirmation", "delayed"):
+        # One conditional statement: if a capture claimed the payment in the meantime, this changes nothing
+        # and the payer is told it can't be cancelled, instead of being told "cancelled" while money moves.
+        changed = session.execute(
+            update(AppPayment)
+            .where(AppPayment.id == payment_id, AppPayment.status.in_(CANCELLABLE))
+            .values(status="cancelled")
+        ).rowcount
+        if changed != 1:
             raise HTTPException(status_code=409, detail="this payment can't be cancelled now")
-        p.status = "cancelled"
-        add_event(session, p.id, "payer", "cancelled")
+        add_event(session, payment_id, "payer", "cancelled")
     return {"status": "cancelled"}
 
 
@@ -895,13 +920,15 @@ def review_queue() -> dict[str, Any]:
         }
 
 
-@router.get("/review/payments/{payment_id}", dependencies=[Depends(require_reviewer)])
-def review_case(payment_id: int) -> dict[str, Any]:
+@router.get("/review/payments/{payment_id}")
+def review_case(payment_id: int, by: str = Depends(require_reviewer)) -> dict[str, Any]:
     _ring_or_503()
     with db.session_scope() as session:
         p = session.get(AppPayment, payment_id)
         if p is None:
             raise HTTPException(status_code=404, detail="payment not found")
+        # Opening a case shows a customer's complaint and evidence, so the read itself is recorded.
+        audit.record(session, by, "case_read", f"payment:{payment_id}", {"payment_id": payment_id}, utcnow())
         return _case(session, p)
 
 
@@ -967,8 +994,28 @@ def approve_refund(
             raise HTTPException(status_code=422, detail="the typed amount doesn't match the payment")
         # Two people for larger refunds: the first approval only records itself; a DIFFERENT named person
         # must give the second. The shared owner key counts as one person ("owner").
-        if p.amount >= Decimal(get_settings().refund_second_approval_usd) and c.status != "refund_approved":
+        settings = get_settings()
+        over_limit = p.amount > Decimal(settings.reviewer_refund_limit_usd)
+        owner_needed = HTTPException(
+            status_code=403,
+            detail=f"refunds over ${settings.reviewer_refund_limit_usd} need the owner as one of the approvers",
+        )
+        if p.amount >= Decimal(settings.refund_second_approval_usd) and c.status != "refund_approved":
+            if not reviewers():
+                # Say so BEFORE recording anything: with only the shared owner key there is nobody who can
+                # give a second approval, and the case would be stuck.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"refunds of ${settings.refund_second_approval_usd} or more need two different people, and "
+                        "no named reviewer is configured (REVIEWERS). Nothing was recorded."
+                    ),
+                )
             first = c.claims.get("_first_approver")
+            # Over the reviewer limit, the owner must be ONE of the two approvers, in either order. So the
+            # first approval is open to anyone, and the pair is checked when the second arrives.
+            if c.status == "awaiting_second_approval" and first != by and over_limit and "owner" not in (first, by):
+                raise owner_needed
             if c.status != "awaiting_second_approval":
                 c.claims = {**c.claims, "_first_approver": by}
                 c.status = "awaiting_second_approval"
@@ -978,6 +1025,8 @@ def approve_refund(
                 return {"status": "awaiting_second_approval", "first_approver": by, "needs": "a different reviewer"}
             if first == by:
                 raise HTTPException(status_code=409, detail="the second approval must come from a different reviewer")
+        elif over_limit and by != "owner" and c.status != "refund_approved":
+            raise owner_needed  # single-approval path (limit set below the two-person threshold)
         c.status = "refund_approved"  # confirmed fraud from here on, even if the PayPal call needs a retry
         add_event(session, payment_id, "reviewer", "refund_approved", {"complaint_id": complaint_id, "by": by})
     try:
@@ -1025,7 +1074,7 @@ def risk_checkpoint() -> dict[str, Any]:
     """Save this somewhere the database can't reach. It is what detects records removed from the end."""
     _ring_or_503()
     with db.session_scope() as session:
-        return service.checkpoint(session)
+        return {**service.checkpoint(session), "audit_count": audit.count(session)}
 
 
 @router.post("/risk/verify", dependencies=[Depends(require_owner)])
@@ -1062,7 +1111,10 @@ def risk_gap(payment_id: int, typology: str = Query(max_length=40)) -> dict[str,
         row = service.decision_for(session, payment_id)
         if row is None:
             raise HTTPException(status_code=404, detail="no decision for that payment")
-        return gap_report(service.open_decision(row), typology)
+        try:
+            return gap_report(service.open_decision(row), typology)
+        except SnapshotError:
+            raise HTTPException(status_code=409, detail="the stored decision could not be read") from None
 
 
 @router.get("/risk/graph/{handle}", dependencies=[Depends(require_reviewer)])
@@ -1102,7 +1154,9 @@ def risk_labels() -> dict[str, Any]:
             rows.append(
                 {
                     "payment_id": c.payment_id,
-                    "label": "legitimate" if c.status == "refund_declined" else "fraud",
+                    "label": "not_upheld" if c.status == "refund_declined" else "fraud",
+                    "amount": f"{session.get(AppPayment, c.payment_id).amount:.2f}",
+                    "decided_at": c.decided_at.isoformat() if c.decided_at else None,
                     "claim": c.claim,
                     "score": d["score"],
                     "action": d["action"],
@@ -1112,17 +1166,70 @@ def risk_labels() -> dict[str, Any]:
                 }
             )
     fraud = [r for r in rows if r["label"] == "fraud"]
-    legit = [r for r in rows if r["label"] == "legitimate"]
-    slowed = lambda rs: sum(1 for r in rs if r["action"] != "allow")  # noqa: E731
+    not_upheld = [r for r in rows if r["label"] == "not_upheld"]
+    allowed = [r for r in fraud if r["action"] == "allow"]
+    money = lambda rs: f"{sum(Decimal(r['amount']) for r in rs):.2f}"  # noqa: E731
     return {
         "labelled": len(rows),
         "fraud": len(fraud),
-        "legitimate": len(legit),
-        "fraud_the_engine_had_slowed": slowed(fraud),
-        "fraud_the_engine_allowed": len(fraud) - slowed(fraud),
-        "legitimate_the_engine_had_slowed": slowed(legit),
-        "note": ("Too few labels to state a rate." if len(rows) < 30 else "Rates on reviewer-labelled payments only."),
+        "not_upheld": len(not_upheld),
+        "fraud_the_engine_had_slowed": len(fraud) - len(allowed),
+        "fraud_the_engine_allowed": len(allowed),
+        "fraud_amount_total": money(fraud),
+        "fraud_amount_the_engine_allowed": money(allowed),
+        "not_upheld_the_engine_had_slowed": sum(1 for r in not_upheld if r["action"] != "allow"),
+        "label_meaning": (
+            "fraud = a reviewer approved the refund. not_upheld = a reviewer declined it, which means the "
+            "reviewer wasn't convinced, NOT that the payment was proven legitimate."
+        ),
+        "note": "Too few labels to state a rate." if len(rows) < 30 else "Rates on reviewer-labelled payments only.",
         "rows": rows,
+    }
+
+
+@router.get("/risk/shadow", dependencies=[Depends(require_owner)])
+def risk_shadow() -> dict[str, Any]:
+    """Shadow-mode results: for every sealed decision the model also scored, did the model and the rules
+    agree? Disagreements are listed with the reviewer outcome where one exists. The model has no effect on
+    any payment; this is the evidence to look at before ever giving it one."""
+    _ring_or_503()
+    with db.session_scope() as session:
+        outcomes = {
+            c.payment_id: ("fraud" if c.status in ("refunded", "refund_approved") else "not_upheld")
+            for c in session.scalars(
+                select(AppComplaint).where(AppComplaint.status.in_(("refunded", "refund_approved", "refund_declined")))
+            )
+        }
+        scored, agree, disagreements, versions = 0, 0, [], set()
+        for row in service.all_rows(session):
+            try:
+                snap = service.open_decision(row)
+            except SnapshotError:
+                continue
+            shadow = snap["evidence"].get("shadow_model")
+            if not shadow:
+                continue
+            scored += 1
+            versions.add(shadow["version"])
+            rules_slow = snap["decision"]["action"] != "allow"
+            if rules_slow == shadow["would_slow"]:
+                agree += 1
+            else:
+                disagreements.append(
+                    {
+                        "payment_id": row.payment_id,
+                        "rules": snap["decision"]["action"],
+                        "model_p_fraud": shadow["p_fraud"],
+                        "reviewer_outcome": outcomes.get(row.payment_id),
+                    }
+                )
+    return {
+        "model_versions": sorted(versions),
+        "decisions_scored_by_model": scored,
+        "agreed": agree,
+        "disagreed": len(disagreements),
+        "disagreements": disagreements[-50:],
+        "note": "shadow mode: the model's output is recorded and never acted on",
     }
 
 
@@ -1137,7 +1244,10 @@ def risk_scam_library() -> dict[str, Any]:
             row = service.decision_for(session, c.payment_id)
             if row is None:
                 continue
-            snap = service.open_decision(row)
+            try:
+                snap = service.open_decision(row)
+            except SnapshotError:
+                continue  # one unreadable record must not take the whole report down
             if c.status == "refunded":
                 typology = snap["decision"]["typology"] or ("authorised_scam" if c.claim == "scam" else "takeover")
                 cases.append({"snapshot": snap, "outcome": "fraud", "typology": typology})
@@ -1150,26 +1260,87 @@ def risk_scam_library() -> dict[str, Any]:
 
 
 @router.get("/review/audit", dependencies=[Depends(require_owner)])
-def review_audit(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
-    """Every reviewer action, newest first, with who did it. No endpoint edits or deletes these rows, but they
-    are ordinary database rows, NOT sealed: someone with database write access could change them. Only the
-    risk decisions are tamper-evident."""
+def review_audit(limit: int = Query(default=100, ge=1, le=500), include_reads: bool = False) -> dict[str, Any]:
+    """Reviewer and owner actions, newest first, from the sealed audit chain. `include_reads=true` also lists
+    who opened which case. Check the chain with GET /review/audit/verify."""
+    from .models import AuditLog
+
     with db.session_scope() as session:
-        rows = session.scalars(
-            select(PaymentEvent).where(PaymentEvent.actor == "reviewer").order_by(PaymentEvent.id.desc()).limit(limit)
-        ).all()
+        q = select(AuditLog).order_by(AuditLog.id.desc()).limit(limit)
+        if not include_reads:
+            q = q.where(AuditLog.action != "case_read")
         return {
+            "sealed": True,
             "actions": [
                 {
-                    "at": e.at.isoformat(),
-                    "by": e.details.get("by", "unknown"),
-                    "action": e.action,
-                    "payment_id": e.payment_id,
-                    "complaint_id": e.details.get("complaint_id"),
+                    "at": r.at,
+                    "by": r.actor,
+                    "action": r.action,
+                    "subject": r.subject,
+                    "payment_id": r.details.get("payment_id"),
+                    "complaint_id": r.details.get("complaint_id"),
+                    "reason": r.details.get("reason"),
                 }
-                for e in rows
-            ]
+                for r in session.scalars(q)
+            ],
         }
+
+
+@router.get("/review/audit/verify", dependencies=[Depends(require_owner)])
+def review_audit_verify(expected_count: int | None = Query(default=None, ge=0)) -> dict[str, Any]:
+    """Recompute every link and signature of the audit chain. Pass the `audit_count` from a saved checkpoint
+    to also detect rows removed from the end."""
+    _ring_or_503()
+    with db.session_scope() as session:
+        return audit.verify(session, expected_count)
+
+
+class ClearBody(BaseModel):
+    reason: str = Field(min_length=5, max_length=200)
+
+
+@router.post("/risk/fraud-flag/{handle}/clear", dependencies=[Depends(require_owner)])
+def clear_fraud_flag(handle: str, body: ClearBody) -> dict[str, Any]:
+    """Owner only: stop earlier confirmed complaints counting against an account (a wrongly approved refund,
+    or demo accounts between takes). The complaints and refunds are kept; the clearing and its reason go into
+    the sealed audit chain. A later confirmed complaint flags the account again."""
+    _ring_or_503()
+    now = clock()
+    with db.session_scope() as session:
+        user = session.scalar(select(AppUser).where(AppUser.handle == handle.strip().lower()))
+        if user is None:
+            raise HTTPException(status_code=404, detail="no such account")
+        user.fraud_cleared_at = now
+        audit.record(
+            session, "owner", "fraud_flag_cleared", f"account:{user.handle}", {"reason": body.reason}, utcnow()
+        )
+        return {"account": user.handle, "cleared_at": now.isoformat()}
+
+
+class SharedDeviceBody(BaseModel):
+    device_id: str
+    note: str = Field(min_length=3, max_length=140)
+
+
+@router.post("/risk/shared-devices", dependencies=[Depends(require_owner)])
+def allow_shared_device(body: SharedDeviceBody) -> dict[str, str]:
+    """Owner only: mark a device as legitimately shared (household, office). The graph then links nobody
+    through it. Audited."""
+    _ring_or_503()
+    if not DEVICE_ID.fullmatch(body.device_id):
+        raise HTTPException(status_code=422, detail="bad device id")
+    with db.session_scope() as session:
+        if session.get(SharedDevice, body.device_id) is None:
+            session.add(SharedDevice(device_id=body.device_id, note=body.note.strip(), added_by="owner"))
+            audit.record(
+                session,
+                "owner",
+                "shared_device_allowed",
+                f"device:{body.device_id[:8]}",
+                {"reason": body.note},
+                utcnow(),
+            )
+    return {"status": "allowed", "device": body.device_id[:8]}
 
 
 @router.get("/metrics", dependencies=[Depends(require_owner)])
@@ -1203,7 +1374,43 @@ def metrics() -> dict[str, Any]:
         )
         total = sum(by_status.values())
         stopped = by_status.get("held", 0) + by_status.get("blocked", 0) + by_status.get("declined", 0)
+        settings = get_settings()
+        timings = sorted(
+            int(d["scoring_ms"])
+            for (d,) in session.execute(
+                select(PaymentEvent.details).where(PaymentEvent.action == "scored", PaymentEvent.at >= day)
+            )
+            if isinstance(d.get("scoring_ms"), int)
+        )
+        p95 = timings[max(0, int(len(timings) * 0.95) - 1)] if timings else None
+        failures = sum(events_24h.get(k, 0) for k in ("paypal_order_failed", "capture_failed", "refund_failed"))
+        scored_24h = events_24h.get("scored", 0)
+        held_24h = session.scalar(
+            select(func.count(AppPayment.id)).where(
+                AppPayment.created_at >= day,
+                AppPayment.seeded.is_(False),
+                AppPayment.status.in_(("held", "blocked", "declined")),
+            )
+        )
+        backlog = int((clock() - oldest_open).total_seconds()) if oldest_open else None
+        human_cases = held_24h + session.scalar(
+            select(func.count(AppComplaint.id)).where(AppComplaint.created_at >= day)
+        )
+        alerts = []
+        if failures:
+            alerts.append(f"{failures} PayPal call(s) failed in 24h")
+        if backlog is not None and backlog > 3600:
+            alerts.append(f"oldest open complaint has waited {backlog // 60} minutes")
+        if scored_24h >= 20 and held_24h / scored_24h > 0.3:
+            alerts.append(f"{held_24h} of {scored_24h} payments stopped in 24h (over 30%): rule misfire or an attack")
+        if p95 is not None and p95 > settings.scoring_target_ms:
+            alerts.append(f"scoring p95 is {p95} ms, over the {settings.scoring_target_ms} ms target")
         return {
+            "alerts": alerts,
+            "scoring_ms_p50_24h": timings[len(timings) // 2] if timings else None,
+            "scoring_ms_p95_24h": p95,
+            "scoring_target_ms": settings.scoring_target_ms,
+            "review_load_per_1000_payments_24h": round(1000 * human_cases / scored_24h, 1) if scored_24h else None,
             "payments_by_status": by_status,
             "payments_total": total,
             "stopped_before_paypal_share": round(stopped / total, 3) if total else None,

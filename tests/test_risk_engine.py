@@ -59,7 +59,7 @@ def test_none_values_count_as_missing_not_as_false() -> None:
 
 def test_signal_ids_are_unique_and_every_category_has_a_cap() -> None:
     ids = [s.id for s in SIGNALS]
-    assert len(ids) == len(set(ids)) == 45
+    assert len(ids) == len(set(ids)) == 47
     assert {s.category for s in SIGNALS} == set(CATEGORY_CAPS)
 
 
@@ -345,8 +345,22 @@ def test_benchmark_is_reproducible_and_the_published_file_matches_the_code() -> 
     spec.loader.exec_module(bench)
     first, second = bench.run(), bench.run()
     assert first["rows"] == second["rows"] and bench.run_held_out()["rows"] == bench.run_held_out()["rows"]
-    assert Path("BENCHMARK.md").read_text(encoding="utf-8") == bench.report(first, bench.run_held_out()) + "\n"
-    assert "precision" not in bench.report(first).split("## Tuning set")[1].lower()
-    rows = {name: (slowed, n) for _, name, n, slowed, _ in first["rows"]}
+    text = bench.report()
+    assert Path("BENCHMARK.md").read_text(encoding="utf-8") == text + "\n"
+    assert text.index("## Held-out set") < text.index("## Tuning set")  # the honest number comes first
+    assert "precision" not in text.lower().replace("no precision figure", "")
+    rows = {name: (slowed, n) for _, name, n, slowed, *_ in first["rows"]}
     assert rows["fraud_known_bad_recipient"][0] == rows["fraud_known_bad_recipient"][1]  # the gap that was fixed
     assert rows["legit_repeat"][0] == 0
+
+
+def test_shadow_model_learns_a_separable_pattern_and_ignores_unknown_features() -> None:
+    from app.risk import model as shadow
+
+    fraud = shadow.features_of({"signals_fired": [{"name": "D4_ACTIVE_CALL"}, {"name": "C3_SCAM_REFERENCE"}]})
+    clean = shadow.features_of({"signals_fired": []})
+    trained = shadow.train([(fraud, 1), (clean, 0)] * 20)
+    assert shadow.predict(trained, fraud) > 0.8 and shadow.predict(trained, clean) < 0.2
+    assert shadow.train([(fraud, 1), (clean, 0)] * 20) == trained  # deterministic
+    older = {**trained, "features": ["GONE_SIGNAL", *trained["features"]], "weights": [5.0, *trained["weights"]]}
+    assert shadow.predict(older, clean) == shadow.predict(trained, clean)  # a retired signal's weight is unused
