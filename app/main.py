@@ -6,6 +6,7 @@ Run locally:  uvicorn app.main:app --port 8000
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -120,6 +121,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     snapshot()  # fail at startup if the policy snapshot was tampered with
     db.init_engine(settings.database_url)
     app.state.paypal = PayPalClient(settings)
+    # A fingerprint of the PayPal credentials, so a wrong value on the host can be spotted without printing
+    # it: length, plus the first 8 hex characters of SHA-256. Neither can be turned back into the value.
+    log.info(
+        "PayPal credentials in use: client id %s chars, fingerprint %s; secret %s chars, fingerprint %s",
+        len(settings.paypal_client_id),
+        hashlib.sha256(settings.paypal_client_id.encode()).hexdigest()[:8],
+        len(settings.paypal_client_secret),
+        hashlib.sha256(settings.paypal_client_secret.encode()).hexdigest()[:8],
+    )
     app.state.llm = (
         GeminiLLM(settings.gemini_api_key, settings.gemini_model, settings.gemini_fallback_model)
         if settings.gemini_api_key
