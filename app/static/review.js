@@ -47,6 +47,7 @@ async function openCase(id) {
     const w = el("div"); w.append(kv("Reasons", d.reason_codes.join(", ") || "none"), kv("Type", d.typology || "none"), kv("Combination rules", d.floors_triggered.join(", ") || "none"), kv("Trust reductions", (d.reductions || []).join(", ") || "none"));
     row.append(s, w); body.append(row);
     body.append(kv("Signals fired", d.signals_fired.join(", ") || "none", "mono"), kv("Unknown inputs (scored 0)", d.missing_data.join(", ") || "none", "mono"));
+    if (d.evidence_note) body.append(el("p", d.evidence_note, "tag"));
     if (d.simulated_fields.length) body.append(kv("Simulated in the demo", d.simulated_fields.join(", "), "tag"));
   } else if (d) body.append(el("p", d.error, "err"));
   if (c.complaint) {

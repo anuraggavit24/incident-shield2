@@ -76,7 +76,7 @@ class Settings:
     trust_proxy: bool = False  # read the client IP from X-Forwarded-For (only behind Render's proxy)
     high_value_usd: int = 250
     step_up_delay_minutes: int = 2
-    max_users: int = 500
+    max_users: int = 3000
 
 
 def hash_api_key(raw: str) -> str:
@@ -109,5 +109,5 @@ def get_settings() -> Settings:
         trust_proxy=_flag("TRUST_PROXY"),
         high_value_usd=int(os.getenv("HIGH_VALUE_USD", "250")),
         step_up_delay_minutes=int(os.getenv("STEP_UP_DELAY_MINUTES", "2")),
-        max_users=int(os.getenv("MAX_USERS", "500")),
+        max_users=int(os.getenv("MAX_USERS", "3000")),
     )

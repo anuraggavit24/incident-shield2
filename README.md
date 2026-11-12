@@ -110,10 +110,12 @@ pytest -q
 
 **Payment app**
 - Browser measurements (device id, fingerprint, typing speed) are sent by the client and can be forged. A real deployment needs device attestation. The client IP comes from `X-Forwarded-For` and can be spoofed by a client that adds its own header.
+- Because that evidence can be staged, a fraudster can arrange a takeover-looking record and then claim "unauthorised" to get a high consistency score. The score only orders the reviewer's queue; a human approves every refund, and the console says the evidence is browser-reported.
 - Withheld evidence lowers a score (missing data scores 0). That is a deliberate choice against guessing, and it is exploitable.
 - A refund only goes back to the original payer, and only while the captured funds are still in the sandbox merchant account. In real fraud the money has often left; this app can't recover it, and it can't freeze funds inside PayPal.
 - Demo mode (`SIMULATION_ENABLED=true`) shows the score and reasons to the payer. A real service wouldn't show that to an attacker.
-- The demo accounts have no password: the token in the browser is the login. The reviewer console uses the single owner key.
+- Demo mode also lets any account load a ready-made history (`/app/demo/history`), which earns trust it didn't build. Turn `SIMULATION_ENABLED` off for anything but a demo.
+- The demo accounts have no password: the token in the browser is the login and never expires. Sign-up is open, rate-limited per address, and reveals which handles exist. The reviewer console uses the single owner key.
 - The refund call was tested with a fake PayPal client; see SPIKE.md for what has been run against the live sandbox.
 
 - **No dispute or evidence flow.** It was planned, but buyer disputes couldn't be created in the sandbox (reporting "unauthorized" sent the buyer into account recovery instead), so it was cut rather than faked.

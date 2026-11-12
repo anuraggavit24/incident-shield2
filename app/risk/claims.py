@@ -53,7 +53,9 @@ def extract_claims(llm: LLM | None, text: str) -> dict[str, Any]:
     text = (text or "").strip()[:MAX_TEXT]
     if not text or llm is None:
         return {"values": {}, "status": "unavailable" if text else "no_text"}
-    user = f"{QUESTIONS}\n\n<complaint>\n{text.replace('</complaint>', '')}\n</complaint>"
+    # Angle brackets can't survive, so no tag can be closed or rebuilt from pieces.
+    safe = text.replace("<", "(").replace(">", ")")
+    user = f"{QUESTIONS}\n\n<complaint>\n{safe}\n</complaint>"
     try:
         out = llm.generate(SYSTEM, user, SCHEMA)
     except (LLMError, Exception):  # noqa: BLE001 - extraction is optional; the score works without it

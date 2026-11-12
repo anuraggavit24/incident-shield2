@@ -76,7 +76,9 @@ class SlidingLimit:
             return True
 
 
-signup_limit = SlidingLimit(20)
+signup_limit = SlidingLimit(30)
+SIGNUPS_PER_ADDRESS_PER_MINUTE = 4
+_signup_by_address: dict[str, SlidingLimit] = {}
 
 
 # --------------------------------------------------------------------------- request models
@@ -261,12 +263,10 @@ def _start_order(request: Request, payment_id: int) -> dict[str, Any]:
             request_id=f"order-{payment_id}",
         )
     except PAYPAL_DOWN as exc:
+        # The payment stays cleared-to-pay; the payer can retry (same idempotency key, so never two orders).
         with db.session_scope() as session:
-            p = session.get(AppPayment, payment_id)
-            if p is not None:
-                p.status = "failed"
-                add_event(session, payment_id, "system", "paypal_order_failed", {"error": str(exc)[:200]})
-        raise HTTPException(status_code=502, detail="PayPal could not create the order") from None
+            add_event(session, payment_id, "system", "paypal_order_failed", {"error": str(exc)[:200]})
+        raise HTTPException(status_code=502, detail="PayPal could not create the order; try again") from None
     with db.session_scope() as session:
         p = session.get(AppPayment, payment_id)
         assert p is not None
@@ -279,9 +279,13 @@ def _start_order(request: Request, payment_id: int) -> dict[str, Any]:
 
 
 @router.post("/app/signup")
-def signup(body: SignupBody) -> dict[str, Any]:
+def signup(body: SignupBody, request: Request) -> dict[str, Any]:
     """Create a demo account. The token is shown ONCE and only its hash is stored."""
-    if not signup_limit.allow():
+    address = ip_digest(client_ip(request))
+    if len(_signup_by_address) > 5000:
+        _signup_by_address.clear()
+    mine = _signup_by_address.setdefault(address, SlidingLimit(SIGNUPS_PER_ADDRESS_PER_MINUTE))
+    if not mine.allow() or not signup_limit.allow():
         raise HTTPException(status_code=429, detail="too many sign-ups, try again in a minute")
     handle = body.handle.strip().lower()
     if not HANDLE.fullmatch(handle):
@@ -553,9 +557,12 @@ def approve_link(payment_id: int, request: Request, user_id: int = Depends(curre
         p = session.get(AppPayment, payment_id)
         if p is None or p.payer_id != user_id:
             raise HTTPException(status_code=404, detail="payment not found")
-        if p.status != "awaiting_approval" or not p.paypal_order_id:
+        retry = p.status == "scored"  # cleared to pay, but PayPal failed when the order was created
+        if not retry and (p.status != "awaiting_approval" or not p.paypal_order_id):
             raise HTTPException(status_code=409, detail="payment is not waiting for approval")
         order_id = p.paypal_order_id
+    if retry:
+        return {"approve_url": _start_order(request, payment_id)["approve_url"]}
     try:
         order = _paypal(request).get_order(order_id)
     except PAYPAL_DOWN:
@@ -692,6 +699,10 @@ def _case(session: Session, p: AppPayment) -> dict[str, Any]:
             out["decision"] = {**_decision_summary(snap["decision"], snap["evidence"].get("simulated_fields", []))}
             out["decision"]["reductions"] = [r["name"] for r in snap["decision"]["reductions_applied"]]
             out["decision"]["sealed_at"] = snap["sealed_at"]
+            out["decision"]["evidence_note"] = (
+                "Device, network and behaviour evidence was reported by the payer's browser and can be "
+                "staged. Treat a high consistency score as a reason to look first, not as proof."
+            )
         except SnapshotError:
             out["decision"] = {"error": "could not open (wrong key or altered record)"}
     complaint = session.scalar(select(AppComplaint).where(AppComplaint.payment_id == p.id))
