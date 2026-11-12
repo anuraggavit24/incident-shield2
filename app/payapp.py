@@ -13,6 +13,7 @@ AI never moves money: a human reviewer approves refunds and releases.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import secrets
@@ -31,9 +32,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import db
-from .auth import require_owner
+from .auth import require_owner, require_reviewer
 from .config import get_settings
-from .models import AppComplaint, AppPayment, AppUser, PaymentEvent
+from .models import AppComplaint, AppPayment, AppUser, PaymentEvent, RiskDecision
 from .paypal_client import PayPalClient, PayPalError
 from .risk import service
 from .risk.brief import write_brief
@@ -207,6 +208,9 @@ def add_event(
     session: Session, payment_id: int, actor: str, action: str, details: dict[str, Any] | None = None
 ) -> None:
     session.add(PaymentEvent(payment_id=payment_id, actor=actor, action=action, details=details or {}))
+    # One JSON line per event for log search and alerting. Details hold ids, scores and statuses only:
+    # never tokens, keys or complaint text.
+    log.info(json.dumps({"event": action, "payment_id": payment_id, "actor": actor, **(details or {})}, default=str))
 
 
 def _decision_summary(decision: dict[str, Any], simulated: list[str]) -> dict[str, Any]:
@@ -332,6 +336,17 @@ def me(user_id: int = Depends(current_payer)) -> dict[str, Any]:
             "demo_mode": get_settings().simulation_enabled,
             "payments": [_payment_out(session, p) for p in payments],
         }
+
+
+@router.post("/app/logout")
+def logout(user_id: int = Depends(current_payer)) -> dict[str, str]:
+    """End this login: the stored hash is replaced, so the token in the browser stops working. There is no
+    password in the demo, so the account can't be signed in to again."""
+    with db.session_scope() as session:
+        user = session.get(AppUser, user_id)
+        assert user is not None
+        user.token_hash = hash_token(secrets.token_urlsafe(32))
+    return {"status": "logged_out"}
 
 
 @router.post("/app/me/credentials")
@@ -842,7 +857,7 @@ def _case(session: Session, p: AppPayment) -> dict[str, Any]:
     return out
 
 
-@router.get("/review/queue", dependencies=[Depends(require_owner)])
+@router.get("/review/queue", dependencies=[Depends(require_reviewer)])
 def review_queue() -> dict[str, Any]:
     with db.session_scope() as session:
         held = session.scalars(select(AppPayment).where(AppPayment.status == "held").order_by(AppPayment.id)).all()
@@ -877,7 +892,7 @@ def review_queue() -> dict[str, Any]:
         }
 
 
-@router.get("/review/payments/{payment_id}", dependencies=[Depends(require_owner)])
+@router.get("/review/payments/{payment_id}", dependencies=[Depends(require_reviewer)])
 def review_case(payment_id: int) -> dict[str, Any]:
     _ring_or_503()
     with db.session_scope() as session:
@@ -887,7 +902,7 @@ def review_case(payment_id: int) -> dict[str, Any]:
         return _case(session, p)
 
 
-@router.post("/review/payments/{payment_id}/brief", dependencies=[Depends(require_owner)])
+@router.post("/review/payments/{payment_id}/brief", dependencies=[Depends(require_reviewer)])
 def review_brief(payment_id: int, request: Request) -> dict[str, Any]:
     """AI job 2: a short brief written from code-built facts and checked by code. A brief with a number that
     isn't in the facts, or wording that decides the case, is replaced by a plain template."""
@@ -900,8 +915,8 @@ def review_brief(payment_id: int, request: Request) -> dict[str, Any]:
     return write_brief(request.app.state.llm, case)
 
 
-@router.post("/review/payments/{payment_id}/release", dependencies=[Depends(require_owner)])
-def release_held(payment_id: int, request: Request) -> dict[str, Any]:
+@router.post("/review/payments/{payment_id}/release")
+def release_held(payment_id: int, request: Request, by: str = Depends(require_reviewer)) -> dict[str, Any]:
     """A reviewer clears a held payment. The payer still has to approve it at PayPal."""
     with db.session_scope() as session:
         p = session.get(AppPayment, payment_id)
@@ -910,13 +925,13 @@ def release_held(payment_id: int, request: Request) -> dict[str, Any]:
         if p.status != "held":
             raise HTTPException(status_code=409, detail="payment is not held")
         p.status = "scored"
-        add_event(session, p.id, "reviewer", "released")
+        add_event(session, p.id, "reviewer", "released", {"by": by})
     result = _start_order(request, payment_id)
     return {"status": "awaiting_approval", "order_id": result["order_id"]}
 
 
-@router.post("/review/payments/{payment_id}/decline", dependencies=[Depends(require_owner)])
-def decline_held(payment_id: int) -> dict[str, str]:
+@router.post("/review/payments/{payment_id}/decline")
+def decline_held(payment_id: int, by: str = Depends(require_reviewer)) -> dict[str, str]:
     with db.session_scope() as session:
         p = session.get(AppPayment, payment_id)
         if p is None:
@@ -924,12 +939,14 @@ def decline_held(payment_id: int) -> dict[str, str]:
         if p.status != "held":
             raise HTTPException(status_code=409, detail="payment is not held")
         p.status = "declined"
-        add_event(session, p.id, "reviewer", "declined")
+        add_event(session, p.id, "reviewer", "declined", {"by": by})
     return {"status": "declined"}
 
 
-@router.post("/review/complaints/{complaint_id}/approve", dependencies=[Depends(require_owner)])
-def approve_refund(complaint_id: int, body: ApproveBody, request: Request) -> dict[str, Any]:
+@router.post("/review/complaints/{complaint_id}/approve")
+def approve_refund(
+    complaint_id: int, body: ApproveBody, request: Request, by: str = Depends(require_reviewer)
+) -> dict[str, Any]:
     """A reviewer approves the refund. The amount must be typed to confirm. The money goes back to the
     original payer through PayPal's refund API (the only place PayPal returns it to)."""
     with db.session_scope() as session:
@@ -946,7 +963,7 @@ def approve_refund(complaint_id: int, body: ApproveBody, request: Request) -> di
         if body.confirm_amount.strip() != amount:
             raise HTTPException(status_code=422, detail="the typed amount doesn't match the payment")
         c.status = "refund_approved"  # confirmed fraud from here on, even if the PayPal call needs a retry
-        add_event(session, payment_id, "reviewer", "refund_approved", {"complaint_id": complaint_id})
+        add_event(session, payment_id, "reviewer", "refund_approved", {"complaint_id": complaint_id, "by": by})
     try:
         refund = _paypal(request).refund_capture(
             capture_id, amount, currency, "Refund approved by Incident Shield reviewer", f"refund-{complaint_id}"
@@ -967,8 +984,8 @@ def approve_refund(complaint_id: int, body: ApproveBody, request: Request) -> di
     return {"status": "refunded", "refund_id": refund["id"], "seconds_from_complaint_to_refund": seconds}
 
 
-@router.post("/review/complaints/{complaint_id}/decline", dependencies=[Depends(require_owner)])
-def decline_refund(complaint_id: int) -> dict[str, str]:
+@router.post("/review/complaints/{complaint_id}/decline")
+def decline_refund(complaint_id: int, by: str = Depends(require_reviewer)) -> dict[str, str]:
     with db.session_scope() as session:
         c = session.get(AppComplaint, complaint_id)
         if c is None:
@@ -976,7 +993,7 @@ def decline_refund(complaint_id: int) -> dict[str, str]:
         if c.status not in ("fast_tracked", "in_review", "manual_review"):
             raise HTTPException(status_code=409, detail="this complaint is closed")
         c.status, c.decided_at = "refund_declined", clock()
-        add_event(session, c.payment_id, "reviewer", "refund_declined", {"complaint_id": complaint_id})
+        add_event(session, c.payment_id, "reviewer", "refund_declined", {"complaint_id": complaint_id, "by": by})
     return {"status": "refund_declined"}
 
 
@@ -1050,3 +1067,110 @@ def risk_scam_library() -> dict[str, Any]:
             else:
                 cases.append({"snapshot": snap, "outcome": "legitimate", "typology": None})
     return scam_library(cases)
+
+
+# --------------------------------------------------------------------------- operations (owner key)
+
+
+@router.get("/review/audit", dependencies=[Depends(require_owner)])
+def review_audit(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+    """Every reviewer action, newest first, with who did it. Rows are append-only in the application: no
+    endpoint edits or deletes them."""
+    with db.session_scope() as session:
+        rows = session.scalars(
+            select(PaymentEvent).where(PaymentEvent.actor == "reviewer").order_by(PaymentEvent.id.desc()).limit(limit)
+        ).all()
+        return {
+            "actions": [
+                {
+                    "at": e.at.isoformat(),
+                    "by": e.details.get("by", "unknown"),
+                    "action": e.action,
+                    "payment_id": e.payment_id,
+                    "complaint_id": e.details.get("complaint_id"),
+                }
+                for e in rows
+            ]
+        }
+
+
+@router.get("/metrics", dependencies=[Depends(require_owner)])
+def metrics() -> dict[str, Any]:
+    """Counts for a dashboard or an alert rule. Seeded demo rows are excluded."""
+    day = clock() - timedelta(hours=24)
+    with db.session_scope() as session:
+        by_status = dict(
+            session.execute(
+                select(AppPayment.status, func.count()).where(AppPayment.seeded.is_(False)).group_by(AppPayment.status)
+            ).all()
+        )
+        complaints = dict(
+            session.execute(select(AppComplaint.status, func.count()).group_by(AppComplaint.status)).all()
+        )
+        events_24h = dict(
+            session.execute(
+                select(PaymentEvent.action, func.count()).where(PaymentEvent.at >= day).group_by(PaymentEvent.action)
+            ).all()
+        )
+        waits = sorted(
+            int((p.refunded_at - c.created_at).total_seconds())
+            for c, p in session.execute(
+                select(AppComplaint, AppPayment)
+                .join(AppPayment, AppPayment.id == AppComplaint.payment_id)
+                .where(AppComplaint.status == "refunded", AppPayment.refunded_at.is_not(None))
+            ).all()
+        )
+        oldest_open = session.scalar(
+            select(func.min(AppComplaint.created_at)).where(
+                AppComplaint.status.in_(("fast_tracked", "in_review", "manual_review"))
+            )
+        )
+        total = sum(by_status.values())
+        stopped = by_status.get("held", 0) + by_status.get("blocked", 0) + by_status.get("declined", 0)
+        return {
+            "payments_by_status": by_status,
+            "payments_total": total,
+            "stopped_before_paypal_share": round(stopped / total, 3) if total else None,
+            "complaints_by_status": complaints,
+            "refund_seconds_median": waits[len(waits) // 2] if waits else None,
+            "refund_seconds_max": waits[-1] if waits else None,
+            "oldest_open_complaint_seconds": int((clock() - oldest_open).total_seconds()) if oldest_open else None,
+            "sealed_decisions": session.scalar(select(func.count(RiskDecision.id))),
+            "paypal_failures_24h": sum(
+                events_24h.get(k, 0) for k in ("paypal_order_failed", "capture_failed", "refund_failed")
+            ),
+            "events_24h": events_24h,
+        }
+
+
+@router.get("/review/reconcile", dependencies=[Depends(require_owner)])
+def reconcile(request: Request, limit: int = Query(default=10, ge=1, le=25)) -> dict[str, Any]:
+    """Compare this app's ledger with PayPal for the most recent paid payments: does PayPal agree the order
+    completed, for the same amount and capture? A mismatch means the ledger is wrong and needs a human."""
+    with db.session_scope() as session:
+        rows = session.execute(
+            select(AppPayment.id, AppPayment.paypal_order_id, AppPayment.paypal_capture_id, AppPayment.amount)
+            .where(AppPayment.status.in_(("captured", "refunded")), AppPayment.paypal_order_id.is_not(None))
+            .order_by(AppPayment.id.desc())
+            .limit(limit)
+        ).all()
+    paypal, checked, mismatches = _paypal(request), 0, []
+    for pid, order_id, capture_id, amount in rows:
+        try:
+            order = paypal.get_order(order_id)
+        except PAYPAL_DOWN:
+            mismatches.append({"payment_id": pid, "problem": "could not read the order from PayPal"})
+            continue
+        checked += 1
+        unit = (order.get("purchase_units") or [{}])[0]
+        first = (((unit.get("payments") or {}).get("captures")) or [{}])[0]
+        problems = []
+        if order.get("status") != "COMPLETED":
+            problems.append(f"PayPal order status is {order.get('status')}")
+        if (unit.get("amount") or {}).get("value") != f"{amount:.2f}":
+            problems.append("amount differs")
+        if first.get("id") and first.get("id") != capture_id:
+            problems.append("capture id differs")
+        if problems:
+            mismatches.append({"payment_id": pid, "problem": "; ".join(problems)})
+    return {"checked": checked, "mismatches": mismatches, "ok": not mismatches}

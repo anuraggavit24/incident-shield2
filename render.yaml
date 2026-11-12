@@ -56,3 +56,5 @@ services:
         value: "true"  # demo mode: payers see the score and can switch on simulated signals
       - key: TRUST_PROXY
         value: "true"
+      - key: REVIEWERS
+        sync: false  # optional: name:sha256,name:sha256 from scripts/make_reviewer_key.py

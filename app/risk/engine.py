@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-RULESET_VERSION = "2026.11-1"
+RULESET_VERSION = "2026.11-2"
 TIER_POINTS = {"LOW": 3, "MED": 7, "HIGH": 12}
 CATEGORY_CAPS = {
     "velocity": 20,
@@ -272,6 +272,21 @@ FLOORS: tuple[tuple[str, str, int, tuple[Component, ...]], ...] = (
             ("active call or coaching", (), lambda e, f: bool({"D4_ACTIVE_CALL", "B2_COACHING_SIGNS"} & f)),
             ("new payee", ("new_payee",), lambda e, f: e["new_payee"] is True),
             ("scam reference markers", (), _fired("C3_SCAM_REFERENCE")),
+        ),
+    ),
+    (
+        # Added after the benchmark showed these payments were allowed 85% of the time: the two signals
+        # alone add up to 24 points, under the step-up line.
+        "CONFIRMED_FRAUD_RECIPIENT",
+        "mule_activity",
+        60,
+        (
+            ("recipient on a fraud list", ("on_negative_list",), lambda e, f: e["on_negative_list"] is True),
+            (
+                "recipient has a confirmed complaint",
+                ("recipient_prior_complaints",),
+                lambda e, f: e["recipient_prior_complaints"] >= 1,
+            ),
         ),
     ),
     (

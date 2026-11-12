@@ -1109,3 +1109,98 @@ def test_migration_0005_keeps_the_refunded_complaint_when_duplicates_exist() -> 
         alembic("upgrade", "head")
     with db.get_engine().begin() as c:
         assert [r[0] for r in c.execute(text("SELECT status FROM app_complaints"))] == ["refunded"]
+
+
+# --------------------------------------------------------------------------- roles, audit, operations
+
+
+def test_named_reviewers_work_the_queue_and_every_action_is_recorded_under_their_name(world, monkeypatch) -> None:
+    import hashlib
+
+    monkeypatch.setenv("REVIEWERS", f"asha:{hashlib.sha256(b'asha-key').hexdigest()}, bad entry, owner:{'0' * 64}")
+    asha = {"X-API-Key": "asha-key"}
+    alice, pid = captured_scam_payment(world)  # released by the owner inside the helper
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    assert world.get("/review/queue", headers=asha).status_code == 200
+    assert (
+        world.post(f"/review/complaints/{cid}/approve", headers=asha, json={"confirm_amount": "45.00"}).status_code
+        == 200
+    )
+    # a reviewer can't reach owner-only endpoints, and the payer's token is not a reviewer key
+    for path in ("/review/audit", "/metrics", "/risk/checkpoint", "/risk/scam-library", "/review/reconcile"):
+        assert world.get(path, headers=asha).status_code == 401, path
+    assert world.get("/review/queue", headers={"X-API-Key": alice["Authorization"][7:]}).status_code == 401
+    assert world.get("/review/queue", headers={"X-API-Key": "0" * 64}).status_code == 401
+    audit = world.get("/review/audit", headers=OWNER).json()["actions"]
+    assert [(a["by"], a["action"]) for a in audit] == [("asha", "refund_approved"), ("owner", "released")]
+    assert audit[0]["complaint_id"] == cid and audit[0]["payment_id"] == pid
+
+
+def test_logout_kills_the_token(world) -> None:
+    alice = signup(world, "alice")
+    assert world.post("/app/logout", headers=alice).json() == {"status": "logged_out"}
+    assert world.get("/app/me", headers=alice).status_code == 401
+
+
+def test_metrics_report_counts_and_refund_time_and_events_are_logged_as_json(world, caplog) -> None:
+    import json
+    import logging
+
+    alice, pid = captured_scam_payment(world)
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    world.now["t"] = T0 + timedelta(seconds=90)
+    with caplog.at_level(logging.INFO, logger="incident_shield.payapp"):
+        world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json={"confirm_amount": "45.00"})
+    lines = [json.loads(r.message) for r in caplog.records if r.name == "incident_shield.payapp"]
+    assert {
+        "event": "refund_approved",
+        "payment_id": pid,
+        "actor": "reviewer",
+        "complaint_id": cid,
+        "by": "owner",
+    } in lines
+    assert not any("token" in json.dumps(line).lower() for line in lines)
+    blocked = pay(world, alice, "carol", 46, name="Carol", ref="release fee", sim={"active_call": True}).json()
+    assert blocked["status"] == "held"
+    m = world.get("/metrics", headers=OWNER).json()
+    assert m["payments_by_status"] == {"refunded": 1, "held": 1} and m["payments_total"] == 2  # seeded rows excluded
+    assert m["stopped_before_paypal_share"] == 0.5 and m["refund_seconds_median"] == 90
+    assert m["complaints_by_status"] == {"refunded": 1} and m["sealed_decisions"] == 2 and m["paypal_failures_24h"] == 0
+    assert world.get("/metrics").status_code == 401
+
+
+def test_reconcile_compares_the_ledger_with_paypal_and_reports_a_mismatch(world) -> None:
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    pids = []
+    for amount in ("10.00", "11.00"):
+        pid = pay(world, alice, "bob", amount).json()["payment_id"]
+        world.post(f"/app/payments/{pid}/capture", headers=alice)
+        pids.append(pid)
+
+    def paypal_view(order_id):
+        o = world.paypal.orders[order_id]
+        return {
+            "status": "COMPLETED",
+            "purchase_units": [
+                {
+                    "custom_id": o["custom_id"],
+                    "amount": {"value": o["amount"]},
+                    "payments": {"captures": [{"id": f"CAP{order_id[5:]}"}]},
+                }
+            ],
+        }
+
+    world.paypal.get_order = paypal_view
+    assert world.get("/review/reconcile", headers=OWNER).json() == {"checked": 2, "mismatches": [], "ok": True}
+    world.paypal.orders[f"ORDER{pids[0]}"]["amount"] = "99.00"  # PayPal and the ledger now disagree
+    out = world.get("/review/reconcile", headers=OWNER).json()
+    assert out["ok"] is False and out["mismatches"] == [{"payment_id": pids[0], "problem": "amount differs"}]
+
+
+def test_a_payee_with_a_confirmed_fraud_complaint_is_held_for_the_next_payer(world) -> None:
+    alice, pid = captured_scam_payment(world)
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json={"confirm_amount": "45.00"})
+    r = pay(world, signup(world, "dave"), "carol", 10, name="Carol").json()
+    assert r["action"] == "hold_review" and "CONFIRMED_FRAUD_RECIPIENT" in r["decision"]["floors_triggered"]
+    assert not [c for c in world.paypal.called("create_order") if c[2] == str(r["payment_id"])]

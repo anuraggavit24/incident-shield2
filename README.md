@@ -18,7 +18,7 @@ AI never moves money and never approves or declines anything. It has four jobs, 
 
 The evidence decides, and a human approves every refund and release.
 
-Built for the PayPal AI Hackathon (Devpost). **Sandbox only, by design:** the app refuses to start against any non-sandbox PayPal host.
+Built for the PayPal AI Hackathon (Devpost). **This is a sandbox prototype, not a production payment system:** there is no KYC/AML, settlement, chargeback handling or external security review, and it runs as one process on free-tier hosting. **Sandbox only, by design:** the app refuses to start against any non-sandbox PayPal host.
 
 ### What is real and what is simulated
 
@@ -55,9 +55,28 @@ Pages: `/app` (payer checkout), `/review` (reviewer console, owner key), `/docs`
    - If the main model (`GEMINI_MODEL`) is overloaded (429/5xx) or slower than 20 s, the request is tried once on `GEMINI_FALLBACK_MODEL`; each answer records which model replied. Without an API key, over the daily budget, or if both models fail, deterministic template answers take over. Only stable answers are cached; failures are retried next time.
    - The policy hashes detect edits since capture. They don't prove the text came from PayPal: each entry links its source.
 
+## Roles, audit and operations
+
+- **Roles:** the owner key can do everything. Named reviewer keys (`REVIEWERS=asha:<sha256>,...`, from `scripts/make_reviewer_key.py`) can work the review queue only. Every release, decline and refund is recorded under the reviewer's name (`GET /review/audit`).
+- **Operations:** `GET /metrics` (counts, refund time, oldest open complaint, PayPal failures), `GET /review/reconcile` (the ledger against PayPal), one JSON log line per payment event, and `RUNBOOK.md` for deploy, rollback, key rotation and incidents.
+- **Threat model:** `THREAT_MODEL.md` lists each attacker, the control in the code, and what is left open.
+
+## Measured on simulated payments (`BENCHMARK.md`)
+
+`python scripts/benchmark.py` scores 1,275 labelled, simulated payments with the same `decide()` the app uses. **The data is simulated and was written by the authors of the rules, so this is not real-world accuracy.**
+
+| Measure | Value |
+|---|---|
+| Fraud slowed or stopped | 53.8% of 275 |
+| Legitimate payments slowed | 1.2% of 1000 |
+
+The useful part is where it fails. Full-pattern takeover, coached scam, mule recipient, device farm and confirmed-fraud recipient are stopped 92–100% of the time. **Evasive fraud is not caught at all (0%)**: a takeover that waits 72 hours and stays under 3x the usual amount, a coached scam with a bland reference, a mule that keeps 21%, and card testing (the app has no card data). On the legitimate side, 27.5% of people who set up a new phone, reset their password and pay someone new are stopped. The benchmark also found a real gap that was then fixed: payments to an account with a confirmed fraud complaint were allowed 85% of the time until a floor was added (ruleset `2026.11-2`).
+
+**Real Gemini:** `python scripts/ai_eval.py` runs the reference reader, complaint reader and case brief against the real model on small labelled sets and prints the scores. Results: _not yet run; paste the three summary lines here._
+
 ## Risk decision engine and payment app (`app/risk/`, `app/payapp.py`)
 
-- **`engine.py`**: scores one payment 0–100 from 45 named signals in 9 categories, with fixed points per tier, a cap per category, five combination floors (account takeover 85, mule account 80, card testing 80, authorised scam 70, device farm 75) and trust reductions that never go below a floor. Missing evidence scores 0 and is listed under `missing_data`; wrong-type evidence scores 0 and is listed under `invalid_data`.
+- **`engine.py`**: scores one payment 0–100 from 45 named signals in 9 categories, with fixed points per tier, a cap per category, six combination floors (account takeover 85, mule account 80, card testing 80, device farm 75, authorised scam 70, confirmed-fraud recipient 60) and trust reductions that never go below a floor. Missing evidence scores 0 and is listed under `missing_data`; wrong-type evidence scores 0 and is listed under `invalid_data`.
 - **`evidence.py`**: builds the engine's inputs from the ledger (read-only queries) and the browser's aggregate measurements. A device or network only becomes "known" through a **completed** payment, so a blocked attacker can't make a device familiar by retrying.
 - **`snapshot.py` / `service.py`**: every decision is sealed with what the engine knew at that moment: AES-256-GCM, HMAC-SHA256 signature, SHA-256 chain. Nothing readable is stored, the score included. Editing, reordering, or removing a first or middle record is detected by `POST /risk/verify`. **Limit:** records cut off the *end* can't be seen from the chain alone; save `GET /risk/checkpoint` outside the database and pass it to verify. Keys come from environment variables and each record names its key id, so keys can be rotated.
 - **`payapp.py`**: sign-up (token shown once, only its hash stored), score → gate → PayPal order → capture. Before capture the app re-reads the order from PayPal and refuses if the amount or payment id doesn't match or it isn't approved. PayPal calls carry an idempotency key, so a retry can't pay or refund twice.
@@ -125,7 +144,7 @@ pytest -q
 - A refund only goes back to the original payer, and only while the captured funds are still in the sandbox merchant account. In real fraud the money has often left; this app can't recover it, and it can't freeze funds inside PayPal.
 - Demo mode (`SIMULATION_ENABLED=true`) shows the score and reasons to the payer. A real service wouldn't show that to an attacker.
 - Demo mode also lets any account load a ready-made history (`/app/demo/history`), which earns trust it didn't build. Turn `SIMULATION_ENABLED` off for anything but a demo.
-- The demo accounts have no password: the token in the browser is the login and never expires. Sign-up is open, rate-limited per address, and reveals which handles exist. The reviewer console uses the single owner key.
+- The demo accounts have no password: the token in the browser is the login and never expires unless the payer logs out. Sign-up is open, rate-limited per address, and reveals which handles exist. The reviewer console uses the single owner key.
 - The refund call was tested with a fake PayPal client; see SPIKE.md for what has been run against the live sandbox.
 
 - **No dispute or evidence flow.** It was planned, but buyer disputes couldn't be created in the sandbox (reporting "unauthorized" sent the buyer into account recovery instead), so it was cut rather than faked.

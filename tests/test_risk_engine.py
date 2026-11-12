@@ -333,3 +333,19 @@ def test_gap_report_and_scam_library_group_what_got_through() -> None:
     assert (mule["cases"], mule["held_or_blocked"], mule["let_through"]) == (2, 1, 1)
     assert mule["thresholds_most_often_just_missed"] == [("RC1_PASS_THROUGH", 1)]
     assert library["takeover"]["cases"] == 1 and library["_false_alarms"] == {"cases": 1, "held_or_blocked": 1}
+
+
+def test_benchmark_is_reproducible_and_the_published_file_matches_the_code() -> None:
+    """BENCHMARK.md must be what the current rules actually score, including the rows that look bad."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location("benchmark", Path("scripts/benchmark.py"))
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    first, second = bench.run(), bench.run()
+    assert first["rows"] == second["rows"]
+    assert Path("BENCHMARK.md").read_text(encoding="utf-8") == bench.report(first) + "\n"
+    rows = {name: (slowed, n) for _, name, n, slowed, _ in first["rows"]}
+    assert rows["fraud_known_bad_recipient"][0] == rows["fraud_known_bad_recipient"][1]  # the gap that was fixed
+    assert rows["legit_repeat"][0] == 0

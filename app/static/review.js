@@ -94,3 +94,6 @@ $("verify").addEventListener("click", async () => {
 });
 $("ckpt").addEventListener("click", async () => { try { $("chain-out").textContent = JSON.stringify(await api("/risk/checkpoint"), null, 2) + "\n\nSave this OUTSIDE the database."; } catch (e) { $("chain-out").textContent = e.message; } });
 $("lib").addEventListener("click", async () => { try { $("chain-out").textContent = JSON.stringify(await api("/risk/scam-library"), null, 2); } catch (e) { $("chain-out").textContent = e.message; } });
+for (const [id, path] of [["audit", "/review/audit"], ["metrics", "/metrics"], ["recon", "/review/reconcile"]]) {
+  $(id).addEventListener("click", async () => { try { $("chain-out").textContent = JSON.stringify(await api(path), null, 2); } catch (e) { $("chain-out").textContent = e.message + " (owner key needed)"; } });
+}
