@@ -349,9 +349,10 @@ def test_softer_scam_signs_delay_the_payment_and_the_delay_is_enforced(world) ->
 
 def test_step_up_needs_the_payee_handle_typed_and_wrong_handle_does_not_pass(world) -> None:
     alice = regular_payer(world)
-    # new device on an old account (7) + device flagged compromised, simulated (12) + name mismatch (7)
-    # + straight-to-max to a new payee (7) = 33: step-up band, device-led so not a coached scam
-    r = pay(world, alice, "carol", 45, name="Someone Else", device=DEV_B, sim={"device_compromised": True}).json()
+    # new device on an old account (7) + anonymising network (7) + network risk flag (7) + name mismatch (7)
+    # + straight-to-max to a new payee (7) = 35: step-up band, and no combination rule applies
+    sim = {"anonymising_asn": True, "network_risk_score_high": True}
+    r = pay(world, alice, "carol", 45, name="Someone Else", device=DEV_B, sim=sim).json()
     assert r["action"] == "step_up", r["decision"]
     pid = r["payment_id"]
     assert world.post(f"/app/payments/{pid}/confirm", headers=alice, json={"typed_handle": "bob"}).status_code == 422
@@ -1885,3 +1886,21 @@ def test_console_data_endpoints(world) -> None:
         page.status_code == 200 and "/static/console.js" in page.text and world.get("/app/classic").status_code == 200
     )
     assert world.get("/static/console.js").status_code == 200 and world.get("/static/console.css").status_code == 200
+
+
+def test_remote_controlled_session_paying_a_stranger_is_no_longer_allowed_at_19(world) -> None:
+    """Seen on the live site: compromised device + remote access + largest-ever payment to a stranger = 19."""
+    alice = regular_payer(world)
+    r = pay(
+        world, alice, "carol", 200, name="Carol", sim={"device_compromised": True, "remote_access_or_overlay": True}
+    ).json()
+    assert r["action"] == "hold_review" and r["decision"]["floors_triggered"] == ["REMOTE_CONTROLLED_SESSION"]
+    assert r["decision"]["score"] == 60 and r["decision"]["typology"] == "takeover"
+    with db.session_scope() as s:
+        snap = service.open_decision(s.scalar(select(RiskDecision).order_by(RiskDecision.id.desc())))
+    assert "T2_KNOWN_DEVICE_AND_NETWORK" not in [x["name"] for x in snap["decision"]["reductions_applied"]]
+    # the same flags on a payment to the usual payee: no floor, and still no trust for the flagged device
+    usual = pay(world, alice, "bob", 20, name="Bob", sim={"remote_access_or_overlay": True}).json()
+    assert usual["decision"]["floors_triggered"] == [] and usual["action"] == "allow"
+    # an ordinary payment keeps its known-device trust
+    assert pay(world, alice, "bob", 20, name="Bob").json()["decision"]["score"] == 0

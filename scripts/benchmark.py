@@ -654,6 +654,13 @@ def report() -> str:
             "written. The first held-out set (v1, 9.4% recall on ruleset 2026.11-2) was retired that way when the "
             "graph signals were added.",
             "",
+            "**Exception, stated plainly:** ruleset 2026.11-4 changed two things after a live test on the deployed "
+            "site, not because of this table: the known-device trust reduction no longer applies when the device "
+            "is flagged compromised or remote-controlled, and a combination rule was added for a remote-controlled "
+            "session paying a stranger its largest amount. No scenario in this set contains those signals and its "
+            "numbers did not move, so it was kept. That still means the authors had seen this table before changing "
+            "a rule, so treat it as weaker than a truly unseen set.",
+            "",
             *_table(held),
             "",
             "## Rules compared with the shadow model",

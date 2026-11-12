@@ -109,7 +109,7 @@ const SCENARIOS = [
   ["Normal payment", { handle: "demo_shop", name: "Demo Shop", amount: "20", ref: "invoice 2231", sims: [] }],
   ["Coached scam", { handle: "demo_stranger", name: "Demo Stranger", amount: "45", ref: "move to safe account", sims: ["active_call"] }],
   ["Reworded scam (AI reads it)", { handle: "demo_stranger", name: "Demo Stranger", amount: "45", ref: "shift my savings into the protected holding acct", sims: ["active_call"] }],
-  ["Large payment to a stranger", { handle: "demo_stranger", name: "Demo Stranger", amount: "200", ref: "", sims: ["device_compromised", "remote_access_or_overlay"] }],
+  ["Remote-controlled device", { handle: "demo_stranger", name: "Demo Stranger", amount: "200", ref: "", sims: ["device_compromised", "remote_access_or_overlay"] }],
 ];
 async function ensureMe() { if (!state.token) { state.me = null; return null; } try { state.me = await api("/app/me"); } catch (e) { state.me = null; state.token = ""; store.set("is_token", ""); } chips(); return state.me; }
 function chips() { $("chip-user").textContent = state.me ? "@" + state.me.handle : "not signed in"; $("chip-mode").textContent = (state.cfg.enforcement === "monitor" ? "Monitor" : "Enforce") + (state.cfg.public_demo ? " · public demo" : ""); }
@@ -255,7 +255,7 @@ async function risk() {
   const c = state.cfg;
   return h("div", {}, head("Risk engine", "47 named signals in 9 categories, fixed points, a cap per category, and combination rules."),
     h("div", { class: "grid g2" }, h("div", { class: "card" }, h("h3", { text: "Score bands" }), table(["Score", "Level", "Engine's action"], [["0–29", "Low", "allow"], ["30–59", "Medium", "step_up"], ["60–79", "High", "hold_review"], ["80–100", "Critical", "block"]].map((r) => ({ cells: [r[0], r[1], tag(r[2])] }))), h("p", { class: "small mute", text: c.enforcement === "monitor" ? "This server is in monitor mode: the action is recorded, not applied." : "This server applies the action." })),
-      h("div", { class: "card" }, h("h3", { text: "Combination rules (minimum scores)" }), table(["Rule", "Minimum"], [["Account takeover", 85], ["Mule account", 80], ["Card testing", 80], ["Device farm", 75], ["Authorised (coached) scam", 70], ["Confirmed-fraud recipient", 60]].map((r) => ({ cells: r }))))),
+      h("div", { class: "card" }, h("h3", { text: "Combination rules (minimum scores)" }), table(["Rule", "Minimum"], [["Account takeover", 85], ["Mule account", 80], ["Card testing", 80], ["Device farm", 75], ["Authorised (coached) scam", 70], ["Confirmed-fraud recipient", 60], ["Remote-controlled session", 60]].map((r) => ({ cells: r }))))),
     h("div", { class: "card" }, h("h3", { text: "What the engine can see" }), table(["Signals", "Source"], [["26", "Computed from this app's own ledger and the browser"], ["7", "Simulated by the demo switches, and recorded as simulated"], ["14", "Never available here (card, issuer, location, identity checks): scored 0"]].map((r) => ({ cells: r })))),
     h("div", { class: "note w", text: "Measured on simulated payments (see BENCHMARK.md in the repository): on fraud the rules were not written around, the engine slowed or stopped 0% of cases. A score is a reason to look, never a confirmed fraud finding." }));
 }

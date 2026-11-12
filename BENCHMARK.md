@@ -1,11 +1,11 @@
-# Benchmark: risk engine ruleset 2026.11-3 on simulated payments (seed 20261112)
+# Benchmark: risk engine ruleset 2026.11-4 on simulated payments (seed 20261112)
 
 **Simulated data, written by the authors of the rules. This is not real-world accuracy.**
 Reproduce with `python scripts/benchmark.py`. "Slowed" = anything but a straight allow (confirm payee, delay, hold, block). "Stopped" = held or blocked.
 
 ## What to take from this
 
-- On fraud it was not written around (the held-out set), the engine slows or stops **0.0%** of cases and **0.0%** of the money. On the tuning set the figures are 35.4% and 35.8%. The gap between the two is the main finding.
+- On fraud it was not written around (the held-out set), the engine slows or stops **0.0%** of cases and **0.0%** of the money. On the tuning set the figures are 38.4% and 38.8%. The gap between the two is the main finding.
 - **It misses these tuning-set fraud types completely (0% slowed):** takeover patient, scam bland, mule careful, card testing, takeover small amounts, mule aged account, ring member.
 - **The cost to honest users is concentrated:** 47.5% of "new phone new payee" payments are stopped outright. Overall false-positive rates hide this because such groups are small.
 - **Review load:** 0.0 cases per 1,000 payments on the held-out mix. Human review capacity, not recall, is what limits a real system.
@@ -14,6 +14,8 @@ Reproduce with `python scripts/benchmark.py`. "Slowed" = anything but a straight
 ## Held-out set (v2)
 
 Written after the last rule change and scored once. No rule, threshold, floor or model may be changed because of this table; if anything changes, these scenarios move to the tuning set and new ones are written. The first held-out set (v1, 9.4% recall on ruleset 2026.11-2) was retired that way when the graph signals were added.
+
+**Exception, stated plainly:** ruleset 2026.11-4 changed two things after a live test on the deployed site, not because of this table: the known-device trust reduction no longer applies when the device is flagged compromised or remote-controlled, and a combination rule was added for a remote-controlled session paying a stranger its largest amount. No scenario in this set contains those signals and its numbers did not move, so it was kept. That still means the authors had seen this table before changing a rule, so treat it as weaker than a truly unseen set.
 
 | Class | Scenario | Payments | Slowed | Stopped |
 |---|---|---|---|---|
@@ -37,7 +39,7 @@ A logistic regression over "which signals fired", trained on a separate random d
 
 | Set | Fraud flagged: rules | model | either | Legit flagged: rules | model | either |
 |---|---|---|---|---|---|---|
-| Tuning | 35.4% | 43.2% | 49.2% | 1.8% | 0.3% | 2.0% |
+| Tuning | 38.4% | 43.2% | 52.2% | 1.8% | 0.3% | 2.0% |
 | Held-out v2 | 0.0% | 1.9% | 1.9% | 1.2% | 25.0% | 25.0% |
 
 ## Tuning set
@@ -61,7 +63,7 @@ Rules have been changed with these numbers in view, so they flatter the engine. 
 | legit | reset then big payment | 40 | 5.0% | 0.0% |
 | fraud | takeover | 40 | 100.0% | 100.0% |
 | fraud | takeover patient | 25 | 0.0% | 0.0% |
-| fraud | takeover session hijack | 25 | 8.0% | 0.0% |
+| fraud | takeover session hijack | 25 | 60.0% | 60.0% |
 | fraud | scam coached | 40 | 80.0% | 80.0% |
 | fraud | scam bland | 30 | 0.0% | 0.0% |
 | fraud | mule recipient | 30 | 100.0% | 100.0% |
@@ -74,7 +76,7 @@ Rules have been changed with these numbers in view, so they flatter the engine. 
 | fraud | mule aged account | 40 | 0.0% | 0.0% |
 | fraud | ring member | 40 | 0.0% | 0.0% |
 
-- Fraud slowed or stopped (recall): **35.4%** of 435; stopped outright: 32.6%
-- Fraud money slowed or stopped: **35.8%** of $486,285; **$312,245 went straight through**
+- Fraud slowed or stopped (recall): **38.4%** of 435; stopped outright: 36.1%
+- Fraud money slowed or stopped: **38.8%** of $486,285; **$297,457 went straight through**
 - Legitimate payments slowed (false-positive rate): **1.8%** of 1160; stopped outright: 1.6%
-- Review load at 0.5% fraud: **17.9 cases per 1,000 payments** need a human; about $44 of review per fraud case stopped (at $4 a review)
+- Review load at 0.5% fraud: **18.1 cases per 1,000 payments** need a human; about $40 of review per fraud case stopped (at $4 a review)

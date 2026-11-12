@@ -19,7 +19,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-RULESET_VERSION = "2026.11-3"
+RULESET_VERSION = "2026.11-4"
 TIER_POINTS = {"LOW": 3, "MED": 7, "HIGH": 12}
 CATEGORY_CAPS = {
     "velocity": 20,
@@ -218,6 +218,8 @@ REDUCTIONS: tuple[tuple[str, int, tuple[str, ...], Test], ...] = (
     ),
 )
 
+DEVICE_NOT_TRUSTWORTHY = {"D2_COMPROMISED_DEVICE", "D3_REMOTE_ACCESS_OR_OVERLAY"}
+
 Component = tuple[str, tuple[str, ...], Callable[[Evidence, set[str]], bool]]
 
 
@@ -290,6 +292,22 @@ FLOORS: tuple[tuple[str, str, int, tuple[Component, ...]], ...] = (
                 ("recipient_prior_complaints",),
                 lambda e, f: e["recipient_prior_complaints"] >= 1,
             ),
+        ),
+    ),
+    (
+        # Added in 2026.11-4 after a live test: a compromised, remote-controlled device sending the account's
+        # largest-ever amount to a stranger scored 19 and was allowed. Three independent signs must all hold.
+        "REMOTE_CONTROLLED_SESSION",
+        "takeover",
+        60,
+        (
+            (
+                "device compromised or under remote control",
+                (),
+                lambda e, f: bool(DEVICE_NOT_TRUSTWORTHY & f),
+            ),
+            ("new payee", ("new_payee",), lambda e, f: e["new_payee"] is True),
+            ("straight to the largest amount", (), _fired("B4_STRAIGHT_TO_MAX_TRANSFER")),
         ),
     ),
     (
@@ -371,6 +389,8 @@ def decide(evidence: Evidence) -> dict[str, Any]:
         lacking = [n for n in needs if n not in e]
         if lacking:
             missing.update(lacking)
+        elif rid == "T2_KNOWN_DEVICE_AND_NETWORK" and fired_ids & DEVICE_NOT_TRUSTWORTHY:
+            continue  # a familiar device earns no trust while that same device is flagged as taken over
         elif _holds(test, invalid, needs, e):
             reductions.append({"name": rid, "points": -points, "raw_value": {n: e[n] for n in needs}})
 
