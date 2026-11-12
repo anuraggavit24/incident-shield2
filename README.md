@@ -99,7 +99,7 @@ API: `GET /health/live`, `GET /health/ready`, `POST /webhooks/paypal`, `GET /cop
 - After the first deploy, register a webhook for `https://<service>.onrender.com/webhooks/paypal` (`python spike/run_spike.py webhook-register --url ...`), put its ID in `PAYPAL_WEBHOOK_ID` on Render, and **wait about 5 minutes** before sending payments (new webhooks miss early events; see SPIKE.md).
 - Payment app: generate keys with `python scripts/make_risk_keys.py` and set `RISK_ENC_KEY_K1`, `RISK_SIGN_KEY_K1` and `PUBLIC_BASE_URL` (`https://<service>.onrender.com`, no trailing slash) on Render. Without the keys `/app` payments answer 503.
 - Free instances sleep after 15 idle minutes and take a while to wake. Open `/health/ready` before a demo. PayPal retries events the sleeping instance missed.
-- Rollback: redeploy the previous commit in the Render dashboard. Migrations only add things (0001–0004), so older code runs on the newer schema; there are no down-migrations to run.
+- Rollback: redeploy the previous commit in the Render dashboard. Migrations only add things (0001–0005), so older code runs on the newer schema; there are no down-migrations to run.
 
 ## Tests
 
@@ -118,7 +118,7 @@ pytest -q
 ## Known limitations
 
 **Payment app**
-- Browser measurements (device id, fingerprint, typing speed) are sent by the client and can be forged. A real deployment needs device attestation. The client IP comes from `X-Forwarded-For` and can be spoofed by a client that adds its own header.
+- Browser measurements (device id, fingerprint, typing speed) are sent by the client and can be forged. A real deployment needs device attestation. The client IP is read from `CF-Connecting-IP` (Render serves through Cloudflare, which sets it), falling back to the first `X-Forwarded-For` entry, which a client can forge. Neither has been verified on the live deployment.
 - Because that evidence can be staged, a fraudster can arrange a takeover-looking record and then claim "unauthorised" to get a high consistency score. The score only orders the reviewer's queue; a human approves every refund, and the console says the evidence is browser-reported.
 - Queue priority uses the customer's own words, so someone can write an urgent-sounding complaint to be seen sooner. The bonus is fixed and small, it is shown to the reviewer with its reason, and it can't override the evidence cap. It changes when a case is looked at, not what is decided.
 - Withheld evidence lowers a score (missing data scores 0). That is a deliberate choice against guessing, and it is exploitable.

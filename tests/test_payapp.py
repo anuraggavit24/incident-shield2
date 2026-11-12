@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select, text
 
 from app import db, payapp
-from app.models import AppComplaint, AppPayment, AppUser, RiskDecision
+from app.models import AppComplaint, AppPayment, AppUser, PaymentEvent, RiskDecision
 from app.paypal_client import PayPalError
 from app.risk import service
 from tests.conftest import TEST_OWNER_KEY
@@ -930,3 +930,182 @@ def test_ai_brief_is_checked_and_replaced_by_a_template_when_it_invents_or_decid
         assert out["source"] == "template" and out["rejected_because"], bad
     world.app_state.llm = FakeLLM(error=True)
     assert world.post(f"/review/payments/{pid}/brief", headers=OWNER).json()["source"] == "template"
+
+
+# --------------------------------------------------------------------------- races and identity
+
+
+def test_cancel_and_second_capture_are_refused_while_a_capture_is_in_flight(world) -> None:
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    pid = pay(world, alice, "bob", "10.00").json()["payment_id"]
+    seen = {}
+    real_get = world.paypal.get_order
+
+    def during_capture(order_id):  # runs between the claim and the PayPal capture call
+        seen["cancel"] = world.post(f"/app/payments/{pid}/cancel", headers=alice).status_code
+        seen["second"] = world.post(f"/app/payments/{pid}/capture", headers=alice).status_code
+        return real_get(order_id)
+
+    world.paypal.get_order = during_capture
+    assert world.post(f"/app/payments/{pid}/capture", headers=alice).status_code == 200
+    assert seen == {"cancel": 409, "second": 409}
+    assert len(world.paypal.called("capture_order")) == 1
+    with db.session_scope() as s:
+        assert s.get(AppPayment, pid).status == "captured"  # the money moved, and the record says so
+
+
+def test_a_failed_capture_releases_the_claim_and_a_stuck_one_can_be_taken_over(world, monkeypatch) -> None:
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    pid = pay(world, alice, "bob", "10.00").json()["payment_id"]
+    world.paypal.approved = False
+    assert world.post(f"/app/payments/{pid}/capture", headers=alice).status_code == 409
+    with db.session_scope() as s:
+        assert s.get(AppPayment, pid).status == "awaiting_approval"  # claim released, can cancel or retry
+        s.get(AppPayment, pid).status = "capturing"  # as if the server died mid-capture just now
+        payapp.add_event(s, pid, "system", "capture_started")
+    world.paypal.approved = True
+    assert world.post(f"/app/payments/{pid}/capture", headers=alice).status_code == 409  # too fresh to take over
+    monkeypatch.setattr(payapp, "STALE_CAPTURE_SECONDS", 0)
+    assert world.post(f"/app/payments/{pid}/capture", headers=alice).json()["status"] == "captured"
+
+
+def test_the_database_allows_one_complaint_per_payment_even_if_two_requests_race(world) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    alice, pid = captured_scam_payment(world)
+
+    class RacingLLM(FakeLLM):  # a second request lands while the first is waiting on the AI
+        def generate(self, system, user, schema):
+            if not self.prompts:
+                self.prompts.append(user)
+                inner = world.post(
+                    f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam", "text": "x y"}
+                )
+                assert inner.status_code == 200
+            return CLAIMS_NO
+
+    world.app_state.llm = RacingLLM()
+    outer = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam", "text": "tricked"})
+    assert outer.status_code == 409
+    with db.session_scope() as s:
+        assert s.scalar(select(func.count(AppComplaint.id))) == 1
+    with pytest.raises(IntegrityError), db.session_scope() as s:
+        s.add(AppComplaint(payment_id=pid, payer_id=uid("alice"), claim="scam", status="in_review"))
+
+
+def test_client_address_prefers_the_edge_header_and_signup_memory_is_bounded(world, monkeypatch) -> None:
+    from app.config import get_settings
+
+    real = get_settings()
+    monkeypatch.setattr(payapp, "get_settings", lambda: type(real)(**{**real.__dict__, "trust_proxy": True}))
+    monkeypatch.setattr(payapp, "SIGNUPS_PER_ADDRESS_PER_MINUTE", 1)
+    forged = {"X-Forwarded-For": "6.6.6.6", "CF-Connecting-IP": "203.0.113.9"}
+    assert world.post("/app/signup", json={"handle": "one", "display_name": "x"}, headers=forged).status_code == 200
+    # changing the header a client controls doesn't give a fresh allowance
+    forged["X-Forwarded-For"] = "7.7.7.7"
+    assert world.post("/app/signup", json={"handle": "two", "display_name": "x"}, headers=forged).status_code == 429
+    monkeypatch.setattr(payapp, "SIGNUP_ADDRESSES_KEPT", 2)
+    for i, ip in enumerate(("198.51.100.1", "198.51.100.2", "198.51.100.3")):
+        world.post("/app/signup", json={"handle": f"lru{i}", "display_name": "x"}, headers={"CF-Connecting-IP": ip})
+    assert len(payapp._signup_by_address) == 2  # oldest dropped, not everyone
+    assert payapp.ip_digest("203.0.113.9") not in payapp._signup_by_address
+
+
+def test_paypal_captured_then_the_server_died_is_recovered_without_capturing_twice(world, monkeypatch) -> None:
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    pid = pay(world, alice, "bob", "10.00").json()["payment_id"]
+    with db.session_scope() as s:  # the claim was made and PayPal captured, then the process stopped
+        s.get(AppPayment, pid).status = "capturing"
+        payapp.add_event(s, pid, "system", "capture_started")
+
+    def completed(order_id):
+        return {
+            "status": "COMPLETED",
+            "purchase_units": [
+                {
+                    "custom_id": str(pid),
+                    "amount": {"value": "10.00", "currency_code": "USD"},
+                    "payments": {
+                        "captures": [
+                            {
+                                "id": "CAPLOST1",
+                                "status": "COMPLETED",
+                                "amount": {"value": "10.00", "currency_code": "USD"},
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+
+    world.paypal.get_order = completed
+    monkeypatch.setattr(payapp, "STALE_CAPTURE_SECONDS", 0)
+    r = world.post(f"/app/payments/{pid}/capture", headers=alice)
+    assert r.status_code == 200 and r.json()["capture_id"] == "CAPLOST1"
+    assert not world.paypal.called("capture_order")  # recorded, not captured again
+    with db.session_scope() as s:
+        p = s.get(AppPayment, pid)
+        assert p.status == "captured" and p.paypal_capture_id == "CAPLOST1"
+        last = s.scalars(
+            select(PaymentEvent).where(PaymentEvent.payment_id == pid, PaymentEvent.action == "captured")
+        ).one()
+        assert last.details["recovered"] is True
+    # and the recovered payment can be refunded like any other
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    assert (
+        world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json={"confirm_amount": "10.00"}).status_code
+        == 200
+    )
+    assert world.paypal.called("refund_capture")[0][1] == "CAPLOST1"
+
+
+def test_a_completed_order_with_the_wrong_amount_or_no_capture_is_not_recorded_as_paid(world) -> None:
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    pid = pay(world, alice, "bob", "10.00").json()["payment_id"]
+    unit = {"custom_id": str(pid), "amount": {"value": "10.00", "currency_code": "USD"}, "payments": {"captures": []}}
+    world.paypal.get_order = lambda order_id: {"status": "COMPLETED", "purchase_units": [unit]}
+    assert world.post(f"/app/payments/{pid}/capture", headers=alice).status_code == 502
+    with db.session_scope() as s:
+        assert s.get(AppPayment, pid).status == "awaiting_approval"
+    unit["payments"]["captures"] = [
+        {"id": "CAPX", "status": "COMPLETED", "amount": {"value": "1.00", "currency_code": "USD"}}
+    ]
+    assert world.post(f"/app/payments/{pid}/capture", headers=alice).status_code == 502
+    with db.session_scope() as s:
+        assert s.get(AppPayment, pid).status == "failed" and s.get(AppPayment, pid).captured_at is None
+
+
+def test_migration_0005_keeps_the_refunded_complaint_when_duplicates_exist() -> None:
+    import os
+    import subprocess
+    import sys
+
+    def alembic(*args: str) -> None:
+        subprocess.run([sys.executable, "-m", "alembic", *args], env={**os.environ}, check=True, capture_output=True)  # noqa: S603
+
+    tables = "payment_events, app_complaints, risk_decisions, app_payments, app_users"
+    alembic("downgrade", "0004")
+    try:
+        with db.get_engine().begin() as c:
+            c.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
+            c.execute(
+                text("INSERT INTO app_users (handle, display_name, token_hash) VALUES ('a','A','h1'), ('b','B','h2')")
+            )
+            c.execute(
+                text(
+                    "INSERT INTO app_payments (payer_id, payee_id, amount, currency, reference, status, client) "
+                    "VALUES (1, 2, 10, 'USD', '', 'refunded', '{}')"
+                )
+            )
+            for status in ("in_review", "refunded", "manual_review"):
+                c.execute(
+                    text(
+                        "INSERT INTO app_complaints (payment_id, payer_id, claim, text, claims, result, status) "
+                        "VALUES (1, 1, 'scam', '', '{}', '{}', :s)"
+                    ),
+                    {"s": status},
+                )
+    finally:
+        alembic("upgrade", "head")
+    with db.get_engine().begin() as c:
+        assert [r[0] for r in c.execute(text("SELECT status FROM app_complaints"))] == ["refunded"]

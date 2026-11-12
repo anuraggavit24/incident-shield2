@@ -18,7 +18,7 @@ import re
 import secrets
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Literal
@@ -26,7 +26,7 @@ from typing import Any, Literal
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -54,6 +54,7 @@ MIN_AMOUNT, MAX_AMOUNT = Decimal("0.50"), Decimal("1000.00")
 PAYPAL_DOWN = (PayPalError, httpx.HTTPError)  # a refusal from PayPal, or PayPal unreachable
 ATTEMPTS_PER_HOUR = 60
 COMPLAINTS_PER_DAY = 5
+STALE_CAPTURE_SECONDS = 60
 
 
 def utcnow() -> datetime:
@@ -79,9 +80,11 @@ class SlidingLimit:
 
 
 signup_limit = SlidingLimit(30)
+_signup_lock = threading.Lock()
 reference_ai_limit = SlidingLimit(12)  # AI reads of payment references per minute (free-tier budget)
 SIGNUPS_PER_ADDRESS_PER_MINUTE = 4
-_signup_by_address: dict[str, SlidingLimit] = {}
+_signup_by_address: OrderedDict[str, SlidingLimit] = OrderedDict()
+SIGNUP_ADDRESSES_KEPT = 5000
 
 
 # --------------------------------------------------------------------------- request models
@@ -167,6 +170,10 @@ def hash_token(token: str) -> str:
 def client_ip(request: Request) -> str:
     settings = get_settings()
     if settings.trust_proxy:
+        # Render serves through Cloudflare, which sets this header itself and overwrites a client's copy.
+        cloudflare = request.headers.get("cf-connecting-ip", "").strip()
+        if cloudflare:
+            return cloudflare[:64]
         forwarded = request.headers.get("x-forwarded-for", "")
         if forwarded:
             # First entry = the browser as the platform's edge reported it. A client can prepend its own
@@ -189,6 +196,11 @@ def current_payer(authorization: str | None = Header(default=None)) -> int:
     if user_id is None:
         raise HTTPException(status_code=401, detail="invalid token")
     return user_id
+
+
+def _payer_lock(session: Session, user_id: int) -> None:
+    """Serialise this payer's writes until the transaction ends (attempt cap, complaint cap)."""
+    session.execute(text("SELECT pg_advisory_xact_lock(:a, :b)"), {"a": 7340, "b": user_id})
 
 
 def add_event(
@@ -285,9 +297,11 @@ def _start_order(request: Request, payment_id: int) -> dict[str, Any]:
 def signup(body: SignupBody, request: Request) -> dict[str, Any]:
     """Create a demo account. The token is shown ONCE and only its hash is stored."""
     address = ip_digest(client_ip(request))
-    if len(_signup_by_address) > 5000:
-        _signup_by_address.clear()
-    mine = _signup_by_address.setdefault(address, SlidingLimit(SIGNUPS_PER_ADDRESS_PER_MINUTE))
+    with _signup_lock:
+        mine = _signup_by_address.setdefault(address, SlidingLimit(SIGNUPS_PER_ADDRESS_PER_MINUTE))
+        _signup_by_address.move_to_end(address)
+        while len(_signup_by_address) > SIGNUP_ADDRESSES_KEPT:
+            _signup_by_address.popitem(last=False)  # drop the least recently seen address only
     if not mine.allow() or not signup_limit.allow():
         raise HTTPException(status_code=429, detail="too many sign-ups, try again in a minute")
     handle = body.handle.strip().lower()
@@ -400,6 +414,7 @@ def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(c
     fast_llm = getattr(request.app.state, "llm_fast", None)
     ref_read = read_reference(fast_llm, body.reference, allow_call=fast_llm is None or reference_ai_limit.allow())
     with db.session_scope() as session:
+        _payer_lock(session, user_id)  # one attempt at a time per payer, so the hourly cap can't be raced
         payer = session.get(AppUser, user_id)
         payee = session.scalar(select(AppUser).where(AppUser.handle == handle))
         assert payer is not None
@@ -524,39 +539,98 @@ def capture_payment(payment_id: int, request: Request, user_id: int = Depends(cu
             raise HTTPException(status_code=404, detail="payment not found")
         if p.status == "captured":
             return {"status": "captured", "already": True}
+        if p.status == "capturing":
+            # A capture that never finished (the server stopped mid-request) may be taken over after a
+            # minute. Safe to repeat: the PayPal capture call carries an idempotency key.
+            started = session.scalar(
+                select(func.max(PaymentEvent.at)).where(
+                    PaymentEvent.payment_id == payment_id, PaymentEvent.action == "capture_started"
+                )
+            )
+            if started is not None and utcnow() - started < timedelta(seconds=STALE_CAPTURE_SECONDS):
+                raise HTTPException(status_code=409, detail="this payment is being completed, try again shortly")
+            p.status = "awaiting_approval"
+            session.flush()
         if p.status != "awaiting_approval" or not p.paypal_order_id:
             raise HTTPException(status_code=409, detail="payment is not waiting for approval")
         order_id, expected = p.paypal_order_id, f"{p.amount:.2f}"
+        # Claim the payment in one statement. From here a cancel or a second capture is refused, so
+        # nothing can change the status while PayPal is being called.
+        claimed = session.execute(
+            update(AppPayment)
+            .where(AppPayment.id == payment_id, AppPayment.status == "awaiting_approval")
+            .values(status="capturing")
+        ).rowcount
+        if claimed != 1:
+            raise HTTPException(status_code=409, detail="payment is not waiting for approval")
+        add_event(session, payment_id, "system", "capture_started")
+
+    def unclaim() -> None:
+        with db.session_scope() as s2:
+            s2.execute(
+                update(AppPayment)
+                .where(AppPayment.id == payment_id, AppPayment.status == "capturing")
+                .values(status="awaiting_approval")
+            )
+
     paypal = _paypal(request)
     try:
         order = paypal.get_order(order_id)
     except PAYPAL_DOWN:
+        unclaim()
         raise HTTPException(status_code=502, detail="could not read the order from PayPal") from None
     unit = (order.get("purchase_units") or [{}])[0]
     amount = unit.get("amount") or {}
     if str(unit.get("custom_id")) != str(payment_id) or amount.get("value") != expected:
+        unclaim()
         raise HTTPException(status_code=409, detail="the PayPal order doesn't match this payment")
+    if order.get("status") == "COMPLETED":
+        # PayPal already captured this order (an earlier attempt got that far, then the server stopped
+        # before recording it). Don't capture again: record the capture PayPal already holds.
+        first = (((unit.get("payments") or {}).get("captures")) or [{}])[0]
+        got = first.get("amount") or {}
+        captured = {
+            "status": str(first.get("status") or ""),
+            "capture_id": str(first.get("id") or ""),
+            "amount": str(got.get("value", "")),
+            "currency": str(got.get("currency_code", "")),
+        }
+        if not captured["capture_id"]:
+            unclaim()
+            raise HTTPException(status_code=502, detail="PayPal shows the order completed but returned no capture")
+        return _record_capture(payment_id, captured, expected, recovered=True)
     if order.get("status") != "APPROVED":
+        unclaim()
         raise HTTPException(status_code=409, detail="not approved at PayPal yet")
     try:
         captured = paypal.capture_order(order_id, request_id=f"capture-{payment_id}")
     except PAYPAL_DOWN as exc:
+        unclaim()  # retrying is safe: the capture call carries an idempotency key
         with db.session_scope() as session:
             add_event(session, payment_id, "paypal", "capture_failed", {"error": str(exc)[:200]})
         raise HTTPException(status_code=502, detail="PayPal could not capture the payment") from None
+    return _record_capture(payment_id, captured, expected, recovered=False)
+
+
+def _record_capture(payment_id: int, captured: dict[str, Any], expected: str, recovered: bool) -> dict[str, Any]:
     with db.session_scope() as session:
         p = session.get(AppPayment, payment_id)
         assert p is not None
-        if captured["status"] != "COMPLETED" or captured["amount"] != expected:
+        ok = captured["status"] == "COMPLETED" and captured["amount"] == expected
+        if ok:
+            p.status, p.paypal_capture_id, p.captured_at = "captured", captured["capture_id"], clock()
+            add_event(
+                session,
+                payment_id,
+                "paypal",
+                "captured",
+                {"capture_id": captured["capture_id"], "recovered": recovered},
+            )
+            add_event(session, payment_id, "system", "payee_credited_in_ledger", {"simulated": True})
+        else:
             p.status = "failed"
             add_event(session, payment_id, "paypal", "capture_not_completed", {"status": captured["status"]})
-            raise_after = True
-        else:
-            p.status, p.paypal_capture_id, p.captured_at = "captured", captured["capture_id"], clock()
-            add_event(session, payment_id, "paypal", "captured", {"capture_id": captured["capture_id"]})
-            add_event(session, payment_id, "system", "payee_credited_in_ledger", {"simulated": True})
-            raise_after = False
-    if raise_after:
+    if not ok:
         raise HTTPException(status_code=502, detail="the capture did not complete")
     return {"status": "captured", "capture_id": captured["capture_id"], "payee_credit": "ledger entry (simulated)"}
 
@@ -647,8 +721,8 @@ def file_complaint(
         )
         past = list(session.scalars(select(AppComplaint).where(AppComplaint.payer_id == user_id)))
         rejected = sum(1 for c in past if c.status == "refund_declined")
-        text = body.text.strip()
-    claims = extract_claims(request.app.state.llm, text)  # network call, outside the transaction
+        text_in = body.text.strip()
+    claims = extract_claims(request.app.state.llm, text_in)  # network call, outside the transaction
     values = claims["values"]
     result = consistency(
         {
@@ -666,12 +740,38 @@ def file_complaint(
     }[result["outcome"]]
     # AI job 3: the AI's reading can move the case up the reviewer's queue (never down, never decide).
     priority = queue_priority(result["consistency_score"], result["outcome"], values)
+    try:
+        return _store_complaint(payment_id, user_id, body.claim, text_in, values, claims, result, priority, status, now)
+    except IntegrityError:  # a second request for the same payment got here first
+        raise HTTPException(status_code=409, detail="this payment already has a complaint") from None
+
+
+def _store_complaint(
+    payment_id: int,
+    user_id: int,
+    claim: str,
+    text_in: str,
+    values: dict[str, Any],
+    claims: dict[str, Any],
+    result: dict[str, Any],
+    priority: dict[str, Any],
+    status: str,
+    now: datetime,
+) -> dict[str, Any]:
     with db.session_scope() as session:
+        _payer_lock(session, user_id)
+        today = session.scalar(
+            select(func.count(AppComplaint.id)).where(
+                AppComplaint.payer_id == user_id, AppComplaint.created_at >= now - timedelta(days=1)
+            )
+        )
+        if (today or 0) >= COMPLAINTS_PER_DAY:  # re-checked under the lock, after the AI call
+            raise HTTPException(status_code=429, detail="too many complaints today")
         complaint = AppComplaint(
             payment_id=payment_id,
             payer_id=user_id,
-            claim=body.claim,
-            text=text,
+            claim=claim,
+            text=text_in,
             claims={**values, "_status": claims["status"], "_prompt": "claims-v2", "_priority": priority},
             result=result,
             status=status,
@@ -685,7 +785,7 @@ def file_complaint(
             "payer",
             "complaint_filed",
             {
-                "claim": body.claim,
+                "claim": claim,
                 "consistency": result["consistency_score"],
                 "outcome": result["outcome"],
                 "queue_priority": priority["priority"],

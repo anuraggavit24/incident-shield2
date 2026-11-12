@@ -195,7 +195,8 @@ class AppComplaint(Base):
     __tablename__ = "app_complaints"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    payment_id: Mapped[int] = mapped_column(ForeignKey("app_payments.id"), index=True)
+    # One complaint per payment, enforced by the database (two quick clicks can't create two).
+    payment_id: Mapped[int] = mapped_column(ForeignKey("app_payments.id"), unique=True)
     payer_id: Mapped[int] = mapped_column(ForeignKey("app_users.id"), index=True)
     claim: Mapped[str] = mapped_column(String(16))  # unauthorised | scam
     text: Mapped[str] = mapped_column(Text, default="")  # victim-typed: untrusted, displayed only
