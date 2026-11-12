@@ -43,3 +43,16 @@ services:
         value: "40"
       - key: PROCESS_INTERVAL_S
         value: "30"
+      # Payment app. Sealed-decision keys: python scripts/make_risk_keys.py (64 hex characters each).
+      - key: RISK_ENC_KEY_K1
+        sync: false
+      - key: RISK_SIGN_KEY_K1
+        sync: false
+      - key: RISK_ACTIVE_KEY_ID
+        value: k1
+      - key: PUBLIC_BASE_URL
+        sync: false  # this service's own https URL, no trailing slash; PayPal sends the payer back to it
+      - key: SIMULATION_ENABLED
+        value: "true"  # demo mode: payers see the score and can switch on simulated signals
+      - key: TRUST_PROXY
+        value: "true"

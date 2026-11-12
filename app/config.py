@@ -50,6 +50,10 @@ def _require(name: str) -> str:
     return value
 
 
+def _flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Settings:
     paypal_api_base: str
@@ -66,6 +70,13 @@ class Settings:
     paypal_merchant_id: str = ""
     webhook_rate_per_minute: int = 300
     verify_concurrency: int = 4
+    # Payment app (simulated PayPal; the money moves through the sandbox)
+    public_base_url: str = "http://localhost:8000"
+    simulation_enabled: bool = False  # demo mode: payers see the score, and may toggle simulated signals
+    trust_proxy: bool = False  # read the client IP from X-Forwarded-For (only behind Render's proxy)
+    high_value_usd: int = 250
+    step_up_delay_minutes: int = 2
+    max_users: int = 500
 
 
 def hash_api_key(raw: str) -> str:
@@ -93,4 +104,10 @@ def get_settings() -> Settings:
         paypal_merchant_id=_require("PAYPAL_MERCHANT_ID"),
         webhook_rate_per_minute=int(os.getenv("WEBHOOK_RATE_PER_MINUTE", "300")),
         verify_concurrency=int(os.getenv("VERIFY_CONCURRENCY", "4")),
+        public_base_url=os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").strip().rstrip("/"),
+        simulation_enabled=_flag("SIMULATION_ENABLED"),
+        trust_proxy=_flag("TRUST_PROXY"),
+        high_value_usd=int(os.getenv("HIGH_VALUE_USD", "250")),
+        step_up_delay_minutes=int(os.getenv("STEP_UP_DELAY_MINUTES", "2")),
+        max_users=int(os.getenv("MAX_USERS", "500")),
     )

@@ -34,3 +34,10 @@ os.environ["DATABASE_URL"] = os.environ.get(
 os.environ.setdefault("OWNER_API_KEY_SHA256", hashlib.sha256(TEST_OWNER_KEY.encode()).hexdigest())
 os.environ.setdefault("PROCESS_INTERVAL_S", "3600")  # tests drive processing explicitly
 os.environ.setdefault("PAYPAL_MERCHANT_ID", "HUU66NVJRLZ2L")  # the sandbox merchant in the fixtures
+
+# Payment app: sealed-decision keys (random test values, not secrets) and demo mode
+os.environ.setdefault("RISK_ENC_KEY_K1", "11" * 32)
+os.environ.setdefault("RISK_SIGN_KEY_K1", "22" * 32)
+os.environ.setdefault("RISK_ACTIVE_KEY_ID", "k1")
+os.environ.setdefault("SIMULATION_ENABLED", "true")
+os.environ.setdefault("STEP_UP_DELAY_MINUTES", "2")

@@ -2,9 +2,28 @@
 
 > AI can explain financial risk. It cannot overrule the evidence, invent policy, or move money without permission.
 
-Incident Shield watches a PayPal business account through PayPal's own APIs (sandbox), detects fraud patterns such as money-mule pass-through with deterministic rules, and groups them into incidents with a full audit trail. An AI Copilot answers questions about an incident, but it only narrates: it can't create, change or close incidents, and Incident Shield never moves money or acts on PayPal at all. Recommended steps are things **you** do on paypal.com.
+Incident Shield is a fraud-protection layer for PayPal-style payments, built as something PayPal could ship as a feature. It has two parts:
+
+1. **A payment app (`/app`) that scores every payment before any money moves.** A 45-signal risk engine returns a 0–100 score; the payment is allowed, needs the payee confirmed, is delayed with a scam warning, is held for a reviewer, or is blocked. Each decision is sealed (encrypted, signed, hash-chained). When a customer later says "that wasn't me" or "I was tricked", the complaint is checked against the sealed record from the moment of payment, consistent complaints go to the front of the queue, and a human reviewer returns the money through PayPal's refund API. The time from complaint to refund is measured and shown.
+2. **A webhook monitor for a PayPal business account** that detects money-mule pass-through with deterministic rules and groups it into incidents, with an AI Copilot that explains an incident and whose every answer is checked by code.
+
+AI never moves money and never decides. It explains incidents and reads complaint text into four yes/no notes; the evidence decides, and a human approves every refund and release.
 
 Built for the PayPal AI Hackathon (Devpost). **Sandbox only, by design:** the app refuses to start against any non-sandbox PayPal host.
+
+### What is real and what is simulated
+
+| Part | Status |
+|---|---|
+| Payer's order, approval, capture, and refund | **Real PayPal sandbox API calls** (Orders v2, capture refund) |
+| Webhook intake, signature verification, incident rules | **Real** sandbox webhooks |
+| 24 of the 45 signals (payment history, devices and networks per account, payee fan-in and pass-through, links to confirmed fraud, typing and focus behaviour, reference text) | **Computed** from this app's own ledger and the browser |
+| 7 signals (active phone call, SIM swap, remote-access tool, compromised device, breached credentials, anonymising network, shared-network risk score) | **Simulated**: switched on by the demo user, and recorded as simulated inside the sealed decision |
+| 14 signals (card and issuer data, geolocation, identity verification, peer comparison) | **Not available**: always listed as missing data and scored 0 |
+| Crediting the payee | **Simulated**: a ledger entry in this app. No payout is sent |
+| Holding funds | The payment is stopped **before** PayPal is called. This app cannot freeze money inside PayPal |
+
+Pages: `/app` (payer checkout), `/review` (reviewer console, owner key), `/docs` (API).
 
 ## How it works
 
@@ -27,17 +46,15 @@ Built for the PayPal AI Hackathon (Devpost). **Sandbox only, by design:** the ap
    - If the main model (`GEMINI_MODEL`) is overloaded (429/5xx) or slower than 20 s, the request is tried once on `GEMINI_FALLBACK_MODEL`; each answer records which model replied. Without an API key, over the daily budget, or if both models fail, deterministic template answers take over. Only stable answers are cached; failures are retried next time.
    - The policy hashes detect edits since capture. They don't prove the text came from PayPal: each entry links its source.
 
-## Risk decision engine (`app/risk/`, in progress)
+## Risk decision engine and payment app (`app/risk/`, `app/payapp.py`)
 
-A second, larger engine is being built next to the pattern detector above. It is pure code with tests; it is **not yet wired** to the API, the database or a payment screen.
-
-- **`engine.py`**: scores one transaction 0–100 from 45 named signals in 9 categories (velocity, device, network, identity, funding, recipient, behaviour, context, external). Fixed points per tier (LOW 3, MED 7, HIGH 12), a cap per category, five combination floors (account takeover 85, mule account 80, card testing 80, authorised scam 70, device farm 75), trust reductions that never go below a floor, and action bands (allow, step-up, hold and review, block). Evidence that is absent is never guessed: the signal scores 0 and the field is listed under `missing_data`. Evidence of the wrong type scores 0 and is listed under `invalid_data` instead of crashing. Because withheld or garbled evidence lowers a score, input must be validated before this is wired to real traffic.
-- **`snapshot.py`**: every decision is sealed with what the engine knew at that moment: encrypted (AES-256-GCM), signed, and chained to the previous record's hash, so editing, reordering, or removing a first or middle record is detected. Nothing readable is stored, the score included. **Limit:** records cut off the *end* of a chain can't be seen from the chain alone, so a signed checkpoint (count and head hash) must be kept outside the database and passed to `verify_chain`. Keys come from environment variables (`load_keyring`) and each record names its key id, so keys can be rotated without losing old records.
-- Rule IDs in the engine (`RC1_…`) are separate from the incident rules (`R1_BURST`, `R2_PASS_THROUGH`, …); the two systems are not merged yet.
-- **`complaint.py`**: when a complaint arrives, its claims are compared with the sealed snapshot, not with current data. A consistent complaint is fast-tracked for refund; an inconsistent one goes to a human reviewer and is never rejected automatically.
-- **`learning.py`**: rescoring everyone who paid a recipient once that recipient is confirmed fraudulent, a gap report for confirmed fraud the engine let through (which thresholds were just missed, which data was absent), and a library of confirmed cases grouped by type.
-
-Most signals need data that PayPal's webhooks don't carry (device, network, session behaviour). The plan is a payment app of our own, with the money moved by the PayPal sandbox, so the app can observe those itself. Telecom, breach, consortium and card-issuer signals can only be simulated in a demo and will be labelled as such.
+- **`engine.py`**: scores one payment 0–100 from 45 named signals in 9 categories, with fixed points per tier, a cap per category, five combination floors (account takeover 85, mule account 80, card testing 80, authorised scam 70, device farm 75) and trust reductions that never go below a floor. Missing evidence scores 0 and is listed under `missing_data`; wrong-type evidence scores 0 and is listed under `invalid_data`.
+- **`evidence.py`**: builds the engine's inputs from the ledger (read-only queries) and the browser's aggregate measurements. A device or network only becomes "known" through a **completed** payment, so a blocked attacker can't make a device familiar by retrying.
+- **`snapshot.py` / `service.py`**: every decision is sealed with what the engine knew at that moment: AES-256-GCM, HMAC-SHA256 signature, SHA-256 chain. Nothing readable is stored, the score included. Editing, reordering, or removing a first or middle record is detected by `POST /risk/verify`. **Limit:** records cut off the *end* can't be seen from the chain alone; save `GET /risk/checkpoint` outside the database and pass it to verify. Keys come from environment variables and each record names its key id, so keys can be rotated.
+- **`payapp.py`**: sign-up (token shown once, only its hash stored), score → gate → PayPal order → capture. Before capture the app re-reads the order from PayPal and refuses if the amount or payment id doesn't match or it isn't approved. PayPal calls carry an idempotency key, so a retry can't pay or refund twice.
+- **`complaint.py` / `claims.py`**: a complaint's consistency (0–100) is computed from the sealed snapshot, not current data. Gemini reads the free text into four booleans, in a delimited block, with the output type-checked; only one of them can affect the score, and the complaint works with the AI off. A low score sends the case to a human; nothing is auto-rejected.
+- **`learning.py`**: when a refund is approved the payee counts as confirmed fraud: later payers to that account score higher, earlier payers can be rescored (`POST /risk/rescore/{handle}`), `GET /risk/gap/{payment}` shows what fired, what was missing and what nearly fired, and `GET /risk/scam-library` groups confirmed cases by type.
+- Rule IDs in the engine (`RC1_…`) are separate from the incident rules (`R1_BURST`, …); the two systems are not merged.
 
 ## Measured in the PayPal sandbox (see SPIKE.md)
 
@@ -63,14 +80,17 @@ Check the AI part against real Gemini (no database needed, 9 calls): `python scr
 
 API: `GET /health/live`, `GET /health/ready`, `POST /webhooks/paypal`, `GET /copilot/questions`, and with header `X-API-Key` (use **Authorize** in `/docs`): `GET /summary`, `GET /transactions`, `GET /rule-hits`, `GET /incidents`, `GET /incidents/{id}`, `POST /incidents/{id}/ask`. Interactive docs at `/docs`.
 
+**Payment app setup:** run `python scripts/make_risk_keys.py`, paste its three lines into `.env`, set `PUBLIC_BASE_URL=http://localhost:8000`, then `alembic upgrade head`. Open `http://localhost:8000/app`, create two accounts (use a second browser profile for the payee), and pay with a sandbox **personal** (buyer) account when PayPal opens.
+
 ## Deploy (Render, free plan)
 
 `render.yaml` is a Blueprint: Render dashboard → **New → Blueprint** → this repo, then fill in the secret values it asks for.
 - Start command runs `alembic upgrade head` first (the free plan has no pre-deploy step; it's a no-op at head), then **one** uvicorn worker.
 - Health check is `/health/live`, which doesn't touch the database, so a cold Neon connect can't fail a deploy. `/health/ready` checks the database with a 5 s connect timeout.
 - After the first deploy, register a webhook for `https://<service>.onrender.com/webhooks/paypal` (`python spike/run_spike.py webhook-register --url ...`), put its ID in `PAYPAL_WEBHOOK_ID` on Render, and **wait about 5 minutes** before sending payments (new webhooks miss early events; see SPIKE.md).
+- Payment app: generate keys with `python scripts/make_risk_keys.py` and set `RISK_ENC_KEY_K1`, `RISK_SIGN_KEY_K1` and `PUBLIC_BASE_URL` (`https://<service>.onrender.com`, no trailing slash) on Render. Without the keys `/app` payments answer 503.
 - Free instances sleep after 15 idle minutes and take a while to wake. Open `/health/ready` before a demo. PayPal retries events the sleeping instance missed.
-- Rollback: redeploy the previous commit in the Render dashboard. Migrations only add things (0001–0003), so older code runs on the newer schema; there are no down-migrations to run.
+- Rollback: redeploy the previous commit in the Render dashboard. Migrations only add things (0001–0004), so older code runs on the newer schema; there are no down-migrations to run.
 
 ## Tests
 
@@ -87,6 +107,14 @@ pytest -q
 ```
 
 ## Known limitations
+
+**Payment app**
+- Browser measurements (device id, fingerprint, typing speed) are sent by the client and can be forged. A real deployment needs device attestation. The client IP comes from `X-Forwarded-For` and can be spoofed by a client that adds its own header.
+- Withheld evidence lowers a score (missing data scores 0). That is a deliberate choice against guessing, and it is exploitable.
+- A refund only goes back to the original payer, and only while the captured funds are still in the sandbox merchant account. In real fraud the money has often left; this app can't recover it, and it can't freeze funds inside PayPal.
+- Demo mode (`SIMULATION_ENABLED=true`) shows the score and reasons to the payer. A real service wouldn't show that to an attacker.
+- The demo accounts have no password: the token in the browser is the login. The reviewer console uses the single owner key.
+- The refund call was tested with a fake PayPal client; see SPIKE.md for what has been run against the live sandbox.
 
 - **No dispute or evidence flow.** It was planned, but buyer disputes couldn't be created in the sandbox (reporting "unauthorized" sent the buyer into account recovery instead), so it was cut rather than faked.
 - **Read-only apart from Copilot questions.** Incident status stays `detected`; there's no endpoint to acknowledge, dismiss or resolve an incident yet.

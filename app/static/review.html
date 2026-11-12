@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Incident Shield: reviewer console</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main>
+<h1>Reviewer console</h1>
+<p class="sub">Humans approve money moves. The AI only reads complaint text into yes/no claims; the evidence decides the rest.</p>
+<section class="card"><div class="row"><div><label for="key">Owner API key (kept in this tab only)</label><input id="key" type="password" autocomplete="off"></div>
+<div class="fit"><button id="load">Load</button></div></div><p class="err" id="err"></p></section>
+<section class="card hide" id="queue"><h2>Needs a decision</h2><table><thead><tr><th>Case</th><th>Type</th><th>Detail</th><th></th></tr></thead><tbody id="q-rows"></tbody></table>
+<p class="mute" id="q-empty"></p></section>
+<section class="card hide" id="recent"><h2>Recent payments</h2><table><thead><tr><th>#</th><th>To</th><th>Amount</th><th>Status</th><th></th></tr></thead><tbody id="r-rows"></tbody></table></section>
+<section class="card hide" id="case"><h2>Case <span id="case-id"></span></h2><div id="case-body"></div></section>
+<section class="card hide" id="chain"><h2>Sealed records</h2>
+<p><button class="ghost" id="verify">Verify chain</button> <button class="ghost" id="ckpt">Get checkpoint</button> <button class="ghost" id="lib">Scam library</button></p>
+<pre class="mono wrap" id="chain-out"></pre></section>
+</main><script src="/static/review.js"></script></body></html>

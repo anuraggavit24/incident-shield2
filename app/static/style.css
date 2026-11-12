@@ -1,0 +1,28 @@
+:root{--bg:#0f1115;--card:#171a21;--line:#2a2f3a;--text:#e6e8ee;--mute:#9aa3b2;--ok:#3ecf8e;--warn:#f5b84b;--bad:#ef6a6a;--acc:#6ea8fe}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
+main{max-width:920px;margin:0 auto;padding:20px}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:0 0 10px}
+.sub{color:var(--mute);margin:0 0 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:14px}
+.banner{border:1px solid var(--line);border-left:3px solid var(--acc);padding:10px 14px;border-radius:6px;background:#12151b;color:var(--mute);margin-bottom:14px}
+label{display:block;color:var(--mute);font-size:13px;margin:10px 0 4px}
+input,select,textarea,button{font:inherit;color:var(--text);background:#0f1218;border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+input,select,textarea{width:100%}
+button{cursor:pointer;background:var(--acc);color:#07101f;border:0;font-weight:600}
+button.ghost{background:transparent;color:var(--text);border:1px solid var(--line);font-weight:400}
+button.danger{background:var(--bad);color:#200}
+button:disabled{opacity:.5;cursor:not-allowed}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}.row>*{flex:1;min-width:140px}
+.pill{display:inline-block;padding:1px 9px;border-radius:99px;font-size:12px;border:1px solid var(--line)}
+.allow,.captured,.refunded{color:var(--ok);border-color:var(--ok)}
+.step_up,.warn_and_delay,.delayed,.awaiting_confirmation,.awaiting_approval,.in_review,.manual_review,.fast_tracked{color:var(--warn);border-color:var(--warn)}
+.hold_review,.held,.block,.blocked,.failed,.declined{color:var(--bad);border-color:var(--bad)}
+.score{font-size:34px;font-weight:700}
+table{width:100%;border-collapse:collapse}td,th{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{color:var(--mute);font-weight:500;font-size:13px}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:13px}
+.sim{border:1px dashed var(--warn)}.tag{color:var(--warn);font-size:12px}
+.hide{display:none}.err{color:var(--bad)}.mute{color:var(--mute)}
+a{color:var(--acc)}
+.fit{flex:0}.nowrap{white-space:nowrap}.mt{margin-top:12px}.narrow{max-width:140px}.wrap{white-space:pre-wrap}

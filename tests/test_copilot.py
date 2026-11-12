@@ -339,7 +339,7 @@ def test_api_ask_endpoint_and_docs(mule_incident, monkeypatch) -> None:
         assert r.status_code == 200 and r.json()["recommended"]
         assert client.post("/incidents/99999/ask", json={"intent": "why_flagged"}, headers=auth).status_code == 404
         assert client.get("/copilot/questions").status_code == 200
-        assert client.get("/", follow_redirects=False).headers["location"] == "/docs"
+        assert client.get("/", follow_redirects=False).headers["location"] == "/app"
         schemes = client.get("/openapi.json").json()["components"]["securitySchemes"]
         assert any(s.get("name") == "X-API-Key" for s in schemes.values())
 

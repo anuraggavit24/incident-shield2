@@ -124,3 +124,97 @@ class CopilotCall(Base):
     intent: Mapped[str] = mapped_column(String(32))
     response: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+# --------------------------------------------------------------------------- payment app (simulated PayPal)
+
+
+class AppUser(Base):
+    """A person using the demo payment app. The bearer token is stored only as a hash."""
+
+    __tablename__ = "app_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    handle: Mapped[str] = mapped_column(String(32), unique=True)
+    display_name: Mapped[str] = mapped_column(String(80))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    credentials_changed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    credentials_changed_device: Mapped[str | None] = mapped_column(String(64))
+    # Demo data only: marks users and payments inserted by the seed script, not made through the app.
+    seeded: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+
+
+class AppPayment(Base):
+    """One payment attempt. The payer's money moves through the PayPal sandbox (order, capture, refund);
+    crediting the payee is a ledger entry in this app."""
+
+    __tablename__ = "app_payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    payer_id: Mapped[int] = mapped_column(ForeignKey("app_users.id"), index=True)
+    payee_id: Mapped[int] = mapped_column(ForeignKey("app_users.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Money)
+    currency: Mapped[str] = mapped_column(String(3), default="USD")
+    reference: Mapped[str] = mapped_column(String(140), default="")
+    # scored -> awaiting_approval | awaiting_confirmation | delayed | held | blocked
+    # awaiting_approval -> captured | cancelled;  captured -> refunded;  held -> awaiting_approval | declined
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    device_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    ip_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    release_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Aggregated browser measurements (typing speed, pastes, focus losses, fingerprint hash). No raw keystrokes.
+    client: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    paypal_order_id: Mapped[str | None] = mapped_column(String(64))
+    paypal_capture_id: Mapped[str | None] = mapped_column(String(64))
+    paypal_refund_id: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    seeded: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+
+
+class RiskDecision(Base):
+    """A sealed decision snapshot. Score, signals and evidence are inside the ciphertext; only the
+    chain fields and the payment link are readable. Rows are append-only and ordered by id."""
+
+    __tablename__ = "risk_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("app_payments.id"), unique=True)
+    key_id: Mapped[str] = mapped_column(String(16))
+    prev_hash: Mapped[str] = mapped_column(String(64))
+    nonce: Mapped[str] = mapped_column(String(24))
+    ciphertext: Mapped[str] = mapped_column(Text)
+    record_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    signature: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AppComplaint(Base):
+    __tablename__ = "app_complaints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("app_payments.id"), index=True)
+    payer_id: Mapped[int] = mapped_column(ForeignKey("app_users.id"), index=True)
+    claim: Mapped[str] = mapped_column(String(16))  # unauthorised | scam
+    text: Mapped[str] = mapped_column(Text, default="")  # victim-typed: untrusted, displayed only
+    claims: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # booleans read from the text
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)  # consistency() output
+    # fast_tracked | in_review | manual_review | refund_approved | refund_declined | refunded
+    status: Mapped[str] = mapped_column(String(24), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PaymentEvent(Base):
+    """Append-only timeline of a payment and any complaint about it."""
+
+    __tablename__ = "payment_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("app_payments.id"), index=True)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    actor: Mapped[str] = mapped_column(String(16))  # payer | system | reviewer | paypal
+    action: Mapped[str] = mapped_column(String(48))
+    details: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)

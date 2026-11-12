@@ -6,7 +6,6 @@ Run locally:  uvicorn app.main:app --port 8000
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 import re
@@ -15,19 +14,21 @@ import time
 from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.security import APIKeyHeader
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 
-from . import db
-from .config import get_settings, hash_api_key
+from . import db, payapp
+from .auth import require_owner
+from .config import get_settings
 from .copilot import INTENTS, GeminiLLM
 from .copilot import answer as copilot_answer
 from .models import Incident, RuleHit, Transaction, WebhookEvent
@@ -145,20 +146,32 @@ async def _sweep_forever(app: FastAPI, interval: float) -> None:
 
 
 app = FastAPI(title="Incident Shield", version="0.1.0", lifespan=lifespan)
+app.include_router(payapp.router)
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+PAGE_HEADERS = {
+    # Scripts only from this origin; the pages never load anything from elsewhere.
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+}
 
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False, description="Owner API key (not the hash)")
+@app.get("/app", include_in_schema=False)
+def checkout_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "checkout.html", headers=PAGE_HEADERS)
 
 
-def require_owner(x_api_key: str | None = Security(api_key_header)) -> None:
-    expected = get_settings().owner_api_key_sha256
-    if not x_api_key or not hmac.compare_digest(hash_api_key(x_api_key), expected):
-        raise HTTPException(status_code=401, detail="invalid API key")
+@app.get("/review", include_in_schema=False)
+def review_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "review.html", headers=PAGE_HEADERS)
 
 
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
-    return RedirectResponse("/docs")
+    return RedirectResponse("/app")
 
 
 # --------------------------------------------------------------------------- health

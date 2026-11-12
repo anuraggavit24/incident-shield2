@@ -56,6 +56,77 @@ class PayPalClient:
             raise PayPalError(f"GET {path} failed: HTTP {response.status_code}")
         return response.json()
 
+    def _post(self, path: str, body: dict[str, Any], request_id: str) -> dict[str, Any]:
+        """POST JSON. `request_id` makes the call idempotent: PayPal returns the first result for a repeat."""
+        response = self._http.post(
+            f"{self.base}{path}",
+            json=body,
+            headers={
+                "Authorization": f"Bearer {self._token_value()}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "PayPal-Request-Id": request_id,
+            },
+        )
+        if response.status_code not in (200, 201):
+            raise PayPalError(f"POST {path} failed: HTTP {response.status_code}")
+        return response.json()
+
+    def create_order(
+        self, amount: str, currency: str, custom_id: str, return_url: str, cancel_url: str, request_id: str
+    ) -> dict[str, Any]:
+        """Create a CAPTURE order and return {"id", "status", "approve_url"}. The buyer approves it at PayPal."""
+        body = {
+            "intent": "CAPTURE",
+            "purchase_units": [
+                {
+                    "custom_id": custom_id,
+                    "amount": {"currency_code": currency, "value": amount},
+                    "description": "Incident Shield demo payment",
+                }
+            ],
+            "payment_source": {
+                "paypal": {
+                    "experience_context": {
+                        "return_url": return_url,
+                        "cancel_url": cancel_url,
+                        "user_action": "PAY_NOW",
+                        "shipping_preference": "NO_SHIPPING",
+                    }
+                }
+            },
+        }
+        order = self._post("/v2/checkout/orders", body, request_id)
+        links = {link.get("rel"): link.get("href") for link in order.get("links", []) if isinstance(link, dict)}
+        approve = links.get("payer-action") or links.get("approve")
+        if not approve or not str(approve).startswith("https://"):
+            raise PayPalError("order has no approval link")
+        return {"id": str(order["id"]), "status": str(order.get("status", "")), "approve_url": str(approve)}
+
+    def capture_order(self, order_id: str, request_id: str) -> dict[str, Any]:
+        """Capture an approved order. Returns {"status", "capture_id", "amount", "currency"}."""
+        if not order_id.replace("-", "").isalnum():
+            raise PayPalError("invalid order id")
+        body = self._post(f"/v2/checkout/orders/{order_id}/capture", {}, request_id)
+        units = body.get("purchase_units") or [{}]
+        captures = ((units[0].get("payments") or {}).get("captures")) or [{}]
+        first = captures[0]
+        amount = first.get("amount") or {}
+        return {
+            "status": str(first.get("status") or body.get("status") or ""),
+            "capture_id": str(first.get("id") or ""),
+            "amount": str(amount.get("value", "")),
+            "currency": str(amount.get("currency_code", "")),
+        }
+
+    def refund_capture(self, capture_id: str, amount: str, currency: str, note: str, request_id: str) -> dict[str, Any]:
+        """Refund a captured payment to the original payer (PayPal only refunds to the original source)."""
+        if not capture_id.replace("-", "").isalnum():
+            raise PayPalError("invalid capture id")
+        body = {"amount": {"value": amount, "currency_code": currency}, "note_to_payer": note[:255]}
+        result = self._post(f"/v2/payments/captures/{capture_id}/refund", body, request_id)
+        return {"id": str(result.get("id", "")), "status": str(result.get("status", ""))}
+
     def verify_webhook(self, headers: dict[str, str], raw: bytes) -> str:
         """Return PayPal's verification_status ('SUCCESS' / 'FAILURE').
 

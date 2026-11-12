@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Incident Shield: payment app demo</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><main>
+<h1>Incident Shield <span class="mute">payment app (demo)</span></h1>
+<p class="sub">A PayPal-style checkout that scores every payment before any money moves.</p>
+<div class="banner">Money moves through the <b>PayPal sandbox</b> (order, approval, capture, refund): no real funds. Crediting the payee is a ledger entry in this app. Signals only a telecom, issuer or consortium could see are switched on by you and are marked <span class="tag">simulated</span>. <a href="/review">Reviewer console</a> &middot; <a href="/docs">API docs</a></div>
+
+<section class="card" id="signup"><h2>1. Create a demo account</h2>
+<div class="row"><div><label for="su-handle">Handle (a-z, 0-9, _)</label><input id="su-handle" maxlength="24" autocomplete="off"></div>
+<div><label for="su-name">Display name</label><input id="su-name" maxlength="80" autocomplete="off"></div>
+<div class="fit"><button id="su-go">Create</button></div></div>
+<p class="err" id="su-err"></p></section>
+
+<section class="card hide" id="account">
+<div class="row"><div><b id="me-handle"></b> <span class="mute" id="me-name"></span></div>
+<div class="fit nowrap"><button class="ghost hide" id="demo-hist" title="Backdate this account and add four past payments, so the scenarios below work">Load demo history</button> <button class="ghost" id="new-device" title="Pretend to use a browser this account has never used">Use a different device</button> <button class="ghost" id="chg-cred" title="Record a password change from this device">Change password (demo)</button></div></div>
+<p class="mute mono" id="device-line"></p>
+<div class="hide" id="guide"><p class="mute"><b>Try these</b> (after "Load demo history"):</p>
+<table><tbody>
+<tr><td>Normal</td><td class="mute">Pay <span class="mono">demo_shop</span> (name Demo Shop) $20 → allowed, score 0.</td></tr>
+<tr><td>Coached scam</td><td class="mute">Pay <span class="mono">demo_stranger</span> (name Demo Stranger) $45, reference "move to safe account", tick "On a phone call" → held for review, nothing sent to PayPal.</td></tr>
+<tr><td>Account takeover</td><td class="mute">Click "Use a different device", then "Change password", then pay <span class="mono">demo_stranger</span> $200 → blocked.</td></tr>
+<tr><td>Refund</td><td class="mute">Complete an allowed payment at PayPal, click "Report a problem", then approve it in the <a href="/review">reviewer console</a>.</td></tr>
+</tbody></table></div></section>
+
+<section class="card hide" id="pay"><h2>2. Send money</h2>
+<div class="row"><div><label for="p-handle">Payee handle</label><input id="p-handle" maxlength="24" autocomplete="off"></div>
+<div><label for="p-name">Payee name (as you know it)</label><input id="p-name" maxlength="80" autocomplete="off"></div>
+<div><label for="p-amount">Amount (USD)</label><input id="p-amount" inputmode="decimal" autocomplete="off"></div></div>
+<label for="p-ref">Payment reference</label><input id="p-ref" maxlength="140" autocomplete="off">
+<div class="card sim hide mt" id="sim"><h2>Simulated signals <span class="tag">simulated: switched on by you</span></h2>
+<div class="row" id="sim-boxes"></div>
+<label for="sim-swap">SIM swap (days ago, blank = none)</label><input id="sim-swap" inputmode="numeric" class="narrow"></div>
+<p><button id="pay-go">Check and pay</button> <span class="err" id="pay-err"></span></p></section>
+
+<section class="card hide" id="result"><h2>Decision</h2><div id="result-body"></div></section>
+<section class="card hide" id="payments"><h2>Your payments</h2><table><thead><tr><th>#</th><th>To</th><th>Amount</th><th>Status</th><th></th></tr></thead><tbody id="pay-rows"></tbody></table></section>
+<section class="card hide" id="complaint"><h2>Report a problem with payment <span id="c-id"></span></h2>
+<label for="c-claim">What happened?</label><select id="c-claim"><option value="unauthorised">I didn't make this payment</option><option value="scam">I was tricked into making it</option></select>
+<label for="c-text">Tell us more (optional)</label><textarea id="c-text" rows="3" maxlength="1000"></textarea>
+<p><button id="c-go">Send</button> <button class="ghost" id="c-cancel">Cancel</button> <span id="c-msg"></span></p></section>
+</main><script src="/static/checkout.js"></script></body></html>
