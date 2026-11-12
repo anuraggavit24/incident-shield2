@@ -16,6 +16,27 @@ class PayPalError(RuntimeError):
     pass
 
 
+def _reason(response: httpx.Response) -> str:
+    """PayPal's own error name, issue and debug id, for the log. These describe the request, not the
+    credentials: no token, secret or customer data is included."""
+    try:
+        body = response.json()
+    except ValueError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    parts = [str(body.get("name") or body.get("error") or "")]
+    details = body.get("details")
+    if isinstance(details, list) and details and isinstance(details[0], dict):
+        parts.append(str(details[0].get("issue") or ""))
+        parts.append(str(details[0].get("field") or ""))
+    parts.append(str(body.get("error_description") or ""))
+    if body.get("debug_id"):
+        parts.append(f"debug_id {body['debug_id']}")
+    text = ", ".join(p for p in parts if p)
+    return f" ({text[:160]})" if text else ""
+
+
 class PayPalClient:
     def __init__(self, settings: Settings, timeout: float = 8.0, transport: httpx.BaseTransport | None = None):
         self.base = assert_sandbox(settings.paypal_api_base)
@@ -41,7 +62,7 @@ class PayPalClient:
                 headers={"Accept": "application/json"},
             )
             if response.status_code != 200:
-                raise PayPalError(f"OAuth token request failed: HTTP {response.status_code}")
+                raise PayPalError(f"OAuth token request failed: HTTP {response.status_code}{_reason(response)}")
             body = response.json()
             self._token = body["access_token"]
             self._expires_at = time.monotonic() + int(body.get("expires_in", 0))
@@ -69,7 +90,7 @@ class PayPalClient:
             },
         )
         if response.status_code not in (200, 201):
-            raise PayPalError(f"POST {path} failed: HTTP {response.status_code}")
+            raise PayPalError(f"POST {path} failed: HTTP {response.status_code}{_reason(response)}")
         return response.json()
 
     def create_order(

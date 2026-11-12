@@ -721,6 +721,10 @@ def test_demo_history_makes_the_three_scenarios_work_from_one_browser(world, mon
     alice = signup(world, "alice")
     assert world.post("/app/demo/history", headers=alice, json={"device_id": DEV_A}).json()["status"] == "ready"
     assert world.post("/app/demo/history", headers=alice, json={"device_id": DEV_A}).status_code == 409
+    seeded = world.get("/app/me", headers=alice).json()["payments"]
+    assert len(seeded) == 4 and all(p["demo_history"] for p in seeded)
+    refused = world.post(f"/app/payments/{seeded[0]['id']}/complaint", headers=alice, json={"claim": "unauthorised"})
+    assert refused.status_code == 409 and "demo-history payment" in refused.json()["detail"]
     normal = pay(world, alice, "demo_shop", 20, name="Demo Shop").json()
     assert normal["action"] == "allow" and normal["decision"]["score"] == 0
     scam = pay(

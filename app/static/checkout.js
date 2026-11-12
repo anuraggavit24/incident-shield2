@@ -73,7 +73,8 @@ async function loadMe() {
     if (p.status === "awaiting_confirmation" || p.status === "delayed") act.append(button("Confirm payee", () => confirmFlow(p)));
     if (p.status === "capturing") act.append(button("Finish payment", async () => { try { await api("/app/payments/" + p.id + "/capture", "POST"); await loadMe(); } catch (e) { alert(e.message); } }));
     if (p.status === "awaiting_approval" || p.status === "scored") act.append(button("Continue to PayPal", () => resumeOrder(p.id)));
-    if (p.status === "captured") act.append(button("Report a problem", () => openComplaint(p.id)));
+    if (p.status === "captured" && !p.demo_history) act.append(button("Report a problem", () => openComplaint(p.id)));
+    if (p.demo_history) act.append(el("span", "demo history", "mute"));
     if (["awaiting_confirmation", "delayed", "awaiting_approval"].includes(p.status)) act.append(" ", button("Cancel", () => cancelPay(p.id), "ghost"));
     tr.append(act); tbody.append(tr);
   }

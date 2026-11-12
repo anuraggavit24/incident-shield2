@@ -264,6 +264,7 @@ def _payment_out(session: Session, p: AppPayment, with_events: bool = False) -> 
         "captured_at": p.captured_at.isoformat() if p.captured_at else None,
         "refunded_at": p.refunded_at.isoformat() if p.refunded_at else None,
         "release_at": p.release_at.isoformat() if p.release_at else None,
+        "demo_history": bool(p.seeded),  # made by "Load demo history": never paid through PayPal
     }
     if with_events:
         events = session.scalars(select(PaymentEvent).where(PaymentEvent.payment_id == p.id).order_by(PaymentEvent.id))
@@ -743,6 +744,12 @@ def file_complaint(
             raise HTTPException(status_code=404, detail="payment not found")
         if p.status != "captured":
             raise HTTPException(status_code=409, detail="only a completed payment can be disputed")
+        if p.seeded:
+            raise HTTPException(
+                status_code=409,
+                detail="this is a demo-history payment: it was never paid through PayPal, so it can't be disputed. "
+                "Make a real payment and report that one.",
+            )
         if session.scalar(select(AppComplaint.id).where(AppComplaint.payment_id == p.id)):
             raise HTTPException(status_code=409, detail="this payment already has a complaint")
         today = session.scalar(
