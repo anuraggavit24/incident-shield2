@@ -91,6 +91,7 @@ function renderDecision(res) {
     top.append(s, w); box.append(top);
     if (d.floors_triggered.length) box.append(el("p", "Combination rule triggered: " + d.floors_triggered.join(", "), "mute"));
     box.append(el("p", "Signals fired: " + (d.signals_fired.join(", ") || "none"), "mute mono"));
+    if (d.ai_reference_read && d.ai_reference_read.status === "ai") box.append(el("p", "AI read your reference: " + (Object.entries(d.ai_reference_read).filter(([k, v]) => v === true).map(([k]) => k.replace(/_/g, " ")).join(", ") || "nothing concerning"), "mute"));
     if (d.simulated_fields.length) box.append(el("p", "Simulated by you: " + d.simulated_fields.join(", "), "tag"));
     box.append(el("p", d.missing_data.length + " inputs were unknown and scored 0 (the app can't see them); this decision is sealed and can't be edited afterwards.", "mute"));
   }

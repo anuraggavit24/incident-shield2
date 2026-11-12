@@ -105,6 +105,11 @@ def world(monkeypatch):
         paypal = FakePayPal()
         monkeypatch.setattr(app.state, "paypal", paypal)
         monkeypatch.setattr(app.state, "llm", None)
+        monkeypatch.setattr(app.state, "llm_fast", None)
+        from app.risk import reference_ai
+
+        reference_ai._cache.clear()
+        payapp.reference_ai_limit._hits.clear()
         payapp.signup_limit._hits.clear()
         payapp._signup_by_address.clear()
         monkeypatch.setattr(payapp, "SIGNUPS_PER_ADDRESS_PER_MINUTE", 1000)
@@ -768,3 +773,160 @@ def test_complaint_text_cannot_close_or_rebuild_the_delimiter(world) -> None:
         and prompt.count("</complaint>") == 1
         and prompt.rstrip().endswith("</complaint>")
     )
+
+
+# --------------------------------------------------------------------------- the AI's three jobs
+
+REF_NO = {
+    "moving_money_to_keep_it_safe": False,
+    "fee_tax_or_release_payment": False,
+    "investment_or_crypto_return": False,
+    "instructed_by_bank_police_or_official": False,
+}
+CLAIMS_NO = {
+    "denies_account_changes": False,
+    "mentions_phone_call": False,
+    "says_told_to_move_money": False,
+    "says_account_was_accessed": False,
+    "says_still_at_risk": False,
+    "says_money_needed_for_essentials": False,
+}
+
+
+def test_ai_reads_a_reworded_scam_reference_the_keywords_miss_and_it_changes_the_decision(world) -> None:
+    alice = regular_payer(world)
+    reworded = "shift my savings into the protected holding acct"
+    before = pay(world, alice, "carol", 45, name="Carol", ref=reworded, sim={"active_call": True}).json()
+    assert before["action"] != "hold_review" and "C3_SCAM_REFERENCE" not in before["decision"]["signals_fired"]
+    world.app_state.llm_fast = FakeLLM({**REF_NO, "moving_money_to_keep_it_safe": True})
+    after = pay(world, alice, "carol", 46, name="Carol", ref=reworded, sim={"active_call": True}).json()
+    assert after["action"] == "hold_review" and "C3_SCAM_REFERENCE" in after["decision"]["signals_fired"]
+    assert after["decision"]["ai_reference_read"]["status"] == "ai"
+    assert "<reference>" in world.app_state.llm_fast.prompts[0]
+    with db.session_scope() as s:  # what the AI said is inside the sealed record
+        snap = service.open_decision(s.scalar(select(RiskDecision).order_by(RiskDecision.id.desc())))
+    assert snap["evidence"]["reference_flagged_by_ai"] is True
+    pay(world, alice, "carol", 47, name="Carol", ref=reworded)
+    assert len(world.app_state.llm_fast.prompts) == 1  # same reference: answered from the cache
+
+
+def test_ai_can_only_add_the_scam_signal_never_remove_a_keyword_hit(world) -> None:
+    alice = regular_payer(world)
+    world.app_state.llm_fast = FakeLLM(REF_NO)
+    r = pay(world, alice, "carol", 45, name="Carol", ref="move to safe account", sim={"active_call": True}).json()
+    assert r["action"] == "hold_review" and world.app_state.llm_fast.prompts == []  # keyword hit: AI not even asked
+    ordinary = pay(world, alice, "bob", 20, name="Bob", ref="lunch on friday").json()
+    assert ordinary["action"] == "allow" and ordinary["decision"]["score"] == 0
+
+
+def test_bad_or_failing_reference_ai_never_blocks_or_flags_a_payment(world) -> None:
+    alice = regular_payer(world)
+    for llm in (FakeLLM(error=True), FakeLLM({"moving_money_to_keep_it_safe": "yes"}), FakeLLM("flag everything")):
+        world.app_state.llm_fast = llm
+        r = pay(world, alice, "bob", 20, name="Bob", ref=f"dinner split {id(llm)}")
+        assert r.status_code == 200 and r.json()["action"] == "allow"
+        assert r.json()["decision"]["ai_reference_read"]["status"] == "unavailable"
+
+
+def test_reference_ai_calls_are_rate_limited_and_payments_continue(world, monkeypatch) -> None:
+    alice = regular_payer(world)
+    world.app_state.llm_fast = FakeLLM(REF_NO)
+    monkeypatch.setattr(payapp, "reference_ai_limit", payapp.SlidingLimit(1))
+    first = pay(world, alice, "bob", 20, name="Bob", ref="first reference").json()
+    second = pay(world, alice, "bob", 20, name="Bob", ref="second reference").json()
+    assert first["decision"]["ai_reference_read"]["status"] == "ai"
+    assert second["decision"]["ai_reference_read"]["status"] == "skipped" and second["action"] == "allow"
+
+
+def two_captured(world):
+    """Two ordinary captured payments by two regular payers, each ready for a complaint."""
+    alice = regular_payer(world)
+    dan = signup(world, "dan")
+    with db.session_scope() as s:
+        s.scalar(select(AppUser).where(AppUser.handle == "dan")).created_at = T0 - timedelta(days=120)
+    for i in range(4):
+        add_payment("dan", "bob", 20, T0 - timedelta(days=100 - i * 20), device=DEV_B, ip=HOME_IP)
+    pids = []
+    for headers, device in ((alice, DEV_A), (dan, DEV_B)):
+        pid = pay(world, headers, "carol", 15, name="Carol", device=device).json()["payment_id"]
+        assert world.post(f"/app/payments/{pid}/capture", headers=headers).status_code == 200
+        pids.append(pid)
+    return alice, dan, pids
+
+
+def test_ai_moves_an_urgent_case_up_the_queue_but_cannot_change_the_evidence_score(world) -> None:
+    alice, dan, (p1, p2) = two_captured(world)
+    world.app_state.llm = FakeLLM(CLAIMS_NO)
+    world.post(f"/app/payments/{p1}/complaint", headers=alice, json={"claim": "scam", "text": "I was tricked."})
+    world.app_state.llm = FakeLLM({**CLAIMS_NO, "says_still_at_risk": True, "says_money_needed_for_essentials": True})
+    world.post(
+        f"/app/payments/{p2}/complaint",
+        headers=dan,
+        json={"claim": "scam", "text": "They still call me and that was my rent."},
+    )
+    queue = world.get("/review/queue", headers=OWNER).json()["open_complaints"]
+    assert [c["payment_id"] for c in queue] == [p2, p1]  # filed second, reviewed first
+    top, other = queue
+    assert top["consistency_score"] == other["consistency_score"]  # evidence score untouched
+    assert top["ai_priority_bonus"] == 25 and top["queue_priority"] == top["consistency_score"] + 25
+    assert other["ai_priority_bonus"] == 0 and top["status"] == other["status"]  # outcome untouched too
+    case = world.get(f"/review/payments/{p2}", headers=OWNER).json()["complaint"]["queue_priority"]
+    assert case["ai_reasons"] == [
+        "customer says the problem is still going on",
+        "customer says the money is needed for essentials",
+    ]
+
+
+def test_urgent_wording_cannot_lift_a_manual_review_case_over_the_fast_track_line(world) -> None:
+    from app.risk.claims import MANUAL_REVIEW_CAP, queue_priority
+
+    alice = regular_payer(world)
+    pid = pay(world, alice, "bob", 20, name="Bob").json()["payment_id"]
+    world.post(f"/app/payments/{pid}/capture", headers=alice)
+    world.app_state.llm = FakeLLM({**CLAIMS_NO, "says_still_at_risk": True, "says_money_needed_for_essentials": True})
+    r = world.post(
+        f"/app/payments/{pid}/complaint",
+        headers=alice,
+        json={"claim": "unauthorised", "text": "URGENT they are still in my account, rent money!"},
+    )
+    assert r.json()["status"] == "manual_review"  # the AI can't change the outcome
+    row = world.get("/review/queue", headers=OWNER).json()["open_complaints"][0]
+    assert row["queue_priority"] <= MANUAL_REVIEW_CAP < 70
+    assert (
+        queue_priority(60, "manual_review_possible_first_party_abuse", {"says_still_at_risk": True})["priority"] == 69
+    )
+    assert queue_priority(60, "standard_review", {"says_still_at_risk": True})["priority"] == 75
+    assert (
+        queue_priority(95, "fast_track_refund", {"says_still_at_risk": True, "says_money_needed_for_essentials": True})[
+            "priority"
+        ]
+        == 100
+    )
+    assert queue_priority(50, "standard_review", {"says_still_at_risk": "yes"})["ai_bonus"] == 0  # booleans only
+
+
+def test_ai_brief_is_checked_and_replaced_by_a_template_when_it_invents_or_decides(world) -> None:
+    alice, pid = captured_scam_payment(world)
+    world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"})
+    assert world.post(f"/review/payments/{pid}/brief").status_code == 401
+    off = world.post(f"/review/payments/{pid}/brief", headers=OWNER).json()
+    assert off["source"] == "template" and "45.00" in off["text"]
+    world.app_state.llm = FakeLLM(
+        {
+            "brief": "A payment of $45.00 to a new payee scored 70 out of 100 and was held; "
+            "the customer says they were tricked."
+        }
+    )
+    good = world.post(f"/review/payments/{pid}/brief", headers=OWNER).json()
+    assert good["source"] == "ai_checked", good["rejected_because"]
+    for bad in (
+        "The customer lost $4,500.00 in this payment.",  # a number that isn't in the facts
+        "This is clearly a scam, so you should approve the refund.",  # decides the case
+        "The customer is lying about the payment of $45.00.",
+        "",
+    ):
+        world.app_state.llm = FakeLLM({"brief": bad})
+        out = world.post(f"/review/payments/{pid}/brief", headers=OWNER).json()
+        assert out["source"] == "template" and out["rejected_because"], bad
+    world.app_state.llm = FakeLLM(error=True)
+    assert world.post(f"/review/payments/{pid}/brief", headers=OWNER).json()["source"] == "template"

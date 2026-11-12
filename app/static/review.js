@@ -21,7 +21,7 @@ async function loadQueue() {
     const a = el("td"); a.append(button("Open", () => openCase(p.id))); tr.append(a); rows.append(tr);
   }
   for (const c of q.open_complaints) {
-    const tr = el("tr"); tr.append(el("td", "#" + c.payment_id), el("td"), el("td", "consistency " + c.consistency_score + " · " + c.claim));
+    const tr = el("tr"); tr.append(el("td", "#" + c.payment_id), el("td"), el("td", "priority " + c.queue_priority + " (evidence " + c.consistency_score + (c.ai_priority_bonus ? ", AI +" + c.ai_priority_bonus : "") + ") · " + c.claim));
     tr.children[1].append(pill(c.status));
     const a = el("td"); a.append(button("Open", () => openCase(c.payment_id))); tr.append(a); rows.append(tr);
   }
@@ -39,6 +39,8 @@ async function openCase(id) {
   const c = await api("/review/payments/" + id);
   const body = $("case-body"); body.replaceChildren(); show("case", true);
   $("case-id").textContent = "#" + id;
+  const briefBox = el("p", "", "mute");
+  body.append(button("AI brief (checked)", async () => { briefBox.textContent = "Writing…"; try { const b = await api("/review/payments/" + id + "/brief", "POST"); briefBox.textContent = (b.source === "ai_checked" ? "AI-written, passed checks: " : "Template (AI off or rejected: " + b.rejected_because.join("; ") + "): ") + b.text; } catch (e) { briefBox.textContent = e.message; } }, "ghost"), briefBox);
   body.append(kv("Payment", "$" + c.amount + " " + c.currency + " from @" + c.payer + " to @" + c.payee), kv("Reference", c.reference || "(none)"), kv("Status", c.status));
   const d = c.decision;
   if (d && d.score !== undefined) {
@@ -55,6 +57,7 @@ async function openCase(id) {
     body.append(kv("Claim", k.claim), kv("Customer wrote (untrusted text)", k.text || "(nothing)"), kv("Status", k.status));
     const ai = Object.entries(k.ai_read_claims).map(([a, b]) => a + "=" + b).join(", ") || "none";
     body.append(kv("AI-read notes (" + (k.ai_status || "n/a") + ")", ai, "mono"));
+    if (k.queue_priority) body.append(kv("Queue priority", k.queue_priority.priority + " = evidence " + k.queue_priority.from_evidence + " + AI " + k.queue_priority.ai_bonus + (k.queue_priority.ai_reasons.length ? " (" + k.queue_priority.ai_reasons.join("; ") + ")" : "") + (k.queue_priority.capped ? " · capped: evidence marked this for manual review" : "")));
     body.append(kv("Consistency with the sealed record", k.consistency.consistency_score + "/100 → " + k.consistency.outcome.replace(/_/g, " ")));
     const t = el("table"); t.append(Object.assign(el("thead"), {}));
     for (const ch of k.consistency.checks) { const tr = el("tr"); tr.append(el("td", (ch.points > 0 ? "+" : "") + ch.points), el("td", ch.check), el("td", ch.meaning, "mute")); t.append(tr); }

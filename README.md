@@ -7,7 +7,16 @@ Incident Shield is a fraud-protection layer for PayPal-style payments, built as 
 1. **A payment app (`/app`) that scores every payment before any money moves.** A 45-signal risk engine returns a 0–100 score; the payment is allowed, needs the payee confirmed, is delayed with a scam warning, is held for a reviewer, or is blocked. Each decision is sealed (encrypted, signed, hash-chained). When a customer later says "that wasn't me" or "I was tricked", the complaint is checked against the sealed record from the moment of payment, consistent complaints go to the front of the queue, and a human reviewer returns the money through PayPal's refund API. The time from complaint to refund is measured and shown.
 2. **A webhook monitor for a PayPal business account** that detects money-mule pass-through with deterministic rules and groups it into incidents, with an AI Copilot that explains an incident and whose every answer is checked by code.
 
-AI never moves money and never decides. It explains incidents and reads complaint text into four yes/no notes; the evidence decides, and a human approves every refund and release.
+AI never moves money and never approves or declines anything. It has four jobs, each fenced by code:
+
+| AI job | What it can do | What it can't do |
+|---|---|---|
+| Read the payment reference at payment time | Add the scam-reference signal when the wording is a scam the keyword list misses | Remove a keyword hit, lower a score, or delay a payment (4 s timeout, then the keyword result stands) |
+| Read a complaint into six yes/no notes | Supply one input to the consistency score | Write numbers, names or verdicts (non-boolean output is discarded) |
+| Prioritise the reviewer's queue | Move a case **up** by a fixed amount (+15 still at risk, +10 money needed for essentials) | Move a case down, change the evidence score or outcome, or lift a case marked for manual review over the fast-track line |
+| Write the reviewer a case brief, and explain incidents | Summarise facts that code built | Use a number that isn't in the facts, or recommend a decision (such a brief is replaced by a template) |
+
+The evidence decides, and a human approves every refund and release.
 
 Built for the PayPal AI Hackathon (Devpost). **Sandbox only, by design:** the app refuses to start against any non-sandbox PayPal host.
 
@@ -111,6 +120,7 @@ pytest -q
 **Payment app**
 - Browser measurements (device id, fingerprint, typing speed) are sent by the client and can be forged. A real deployment needs device attestation. The client IP comes from `X-Forwarded-For` and can be spoofed by a client that adds its own header.
 - Because that evidence can be staged, a fraudster can arrange a takeover-looking record and then claim "unauthorised" to get a high consistency score. The score only orders the reviewer's queue; a human approves every refund, and the console says the evidence is browser-reported.
+- Queue priority uses the customer's own words, so someone can write an urgent-sounding complaint to be seen sooner. The bonus is fixed and small, it is shown to the reviewer with its reason, and it can't override the evidence cap. It changes when a case is looked at, not what is decided.
 - Withheld evidence lowers a score (missing data scores 0). That is a deliberate choice against guessing, and it is exploitable.
 - A refund only goes back to the original payer, and only while the captured funds are still in the sandbox merchant account. In real fraud the money has often left; this app can't recover it, and it can't freeze funds inside PayPal.
 - Demo mode (`SIMULATION_ENABLED=true`) shows the score and reasons to the payer. A real service wouldn't show that to an attacker.

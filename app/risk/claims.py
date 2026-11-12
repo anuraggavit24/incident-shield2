@@ -12,7 +12,7 @@ from typing import Any
 
 from ..copilot import LLM, LLMError
 
-PROMPT_VERSION = "claims-v1"
+PROMPT_VERSION = "claims-v2"
 MAX_TEXT = 1000
 
 SYSTEM = (
@@ -29,12 +29,16 @@ SCHEMA: dict[str, Any] = {
         "mentions_phone_call": {"type": "BOOLEAN"},
         "says_told_to_move_money": {"type": "BOOLEAN"},
         "says_account_was_accessed": {"type": "BOOLEAN"},
+        "says_still_at_risk": {"type": "BOOLEAN"},
+        "says_money_needed_for_essentials": {"type": "BOOLEAN"},
     },
     "required": [
         "denies_account_changes",
         "mentions_phone_call",
         "says_told_to_move_money",
         "says_account_was_accessed",
+        "says_still_at_risk",
+        "says_money_needed_for_essentials",
     ],
 }
 KEYS = tuple(SCHEMA["properties"])
@@ -44,7 +48,11 @@ QUESTIONS = (
     "number or other account details recently?\n"
     "mentions_phone_call: does the customer mention a phone call, text message or email from someone?\n"
     "says_told_to_move_money: does the customer say someone told or pressured them to send this payment?\n"
-    "says_account_was_accessed: does the customer say someone else accessed or logged in to their account?"
+    "says_account_was_accessed: does the customer say someone else accessed or logged in to their account?\n"
+    "says_still_at_risk: does the customer say the problem is still going on, for example someone still has "
+    "access, more payments are being taken, or they are still being contacted and pressured?\n"
+    "says_money_needed_for_essentials: does the customer say they need this money for rent, food, medicine, "
+    "bills or other essentials?"
 )
 
 
@@ -62,3 +70,33 @@ def extract_claims(llm: LLM | None, text: str) -> dict[str, Any]:
         return {"values": {}, "status": "unavailable"}
     values = {k: out[k] for k in KEYS if isinstance(out, dict) and isinstance(out.get(k), bool)}
     return {"values": values, "status": "ai" if values else "unavailable"}
+
+
+# ---- queue priority: where the AI has a say
+#
+# The evidence sets a case's consistency score. The AI's reading of the complaint can then move the case UP
+# the reviewer's queue, by a fixed amount per reason. It cannot move a case down, cannot change the
+# consistency score or the outcome, and cannot approve or decline anything. A case the evidence marked for
+# manual review (possible first-party abuse) is capped below the fast-track line however urgent it sounds,
+# because the complaint text is written by the person asking for money.
+PRIORITY_BONUS = {
+    "says_still_at_risk": (15, "customer says the problem is still going on"),
+    "says_money_needed_for_essentials": (10, "customer says the money is needed for essentials"),
+}
+MANUAL_REVIEW_CAP = 69
+
+
+def queue_priority(consistency_score: int, outcome: str, values: dict[str, Any]) -> dict[str, Any]:
+    reasons = [(pts, why) for key, (pts, why) in PRIORITY_BONUS.items() if values.get(key) is True]
+    bonus = sum(p for p, _ in reasons)
+    priority = min(100, consistency_score + bonus)
+    capped = outcome == "manual_review_possible_first_party_abuse" and priority > MANUAL_REVIEW_CAP
+    if capped:
+        priority = max(consistency_score, MANUAL_REVIEW_CAP)
+    return {
+        "priority": priority,
+        "from_evidence": consistency_score,
+        "ai_bonus": priority - consistency_score,
+        "ai_reasons": [why for _, why in reasons],
+        "capped": capped,
+    }

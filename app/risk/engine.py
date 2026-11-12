@@ -78,6 +78,12 @@ def _has_scam_marker(e: Evidence) -> bool:
     return any(marker in text for marker in SCAM_MARKERS)
 
 
+def _scam_reference(e: Evidence) -> bool:
+    """Keyword hit, or the AI reference reader said yes. The AI can only add this signal: a "no" from it
+    never removes a keyword hit."""
+    return _has_scam_marker(e) or e.get("reference_flagged_by_ai") is True
+
+
 SIGNALS: tuple[Signal, ...] = (
     # 1. Velocity and aggregation
     _over("V1_AMOUNT_ZSCORE", "velocity", "HIGH", "amount_zscore_90d", 3, "ledger"),
@@ -174,7 +180,7 @@ SIGNALS: tuple[Signal, ...] = (
     # 8. Transaction context
     _flag("C1_AMOUNT_EXTREME_VS_PEERS", "context", "MED", "amount_extreme_vs_peers", "ledger"),
     _flag("C2_HIGH_RISK_CORRIDOR", "context", "LOW", "high_risk_corridor"),
-    Signal("C3_SCAM_REFERENCE", "context", "MED", ("payment_reference",), _has_scam_marker),
+    Signal("C3_SCAM_REFERENCE", "context", "MED", ("payment_reference",), _scam_reference),
     _flag("C4_PERSONAL_PAYMENT_FOR_PURCHASE", "context", "LOW", "personal_payment_for_purchase"),
     # 9. External and consortium data
     _flag("E1_ON_NEGATIVE_LIST", "external", "HIGH", "on_negative_list", "external"),

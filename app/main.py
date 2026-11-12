@@ -125,6 +125,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.gemini_api_key
         else None
     )
+    # Same model with a short timeout and no fallback, for the payment path: a slow AI must not hold up a
+    # payment (the keyword check has already run by then).
+    app.state.llm_fast = (
+        GeminiLLM(settings.gemini_api_key, settings.gemini_model, timeout=4.0) if settings.gemini_api_key else None
+    )
     app.state.webhook_limiter = RateLimiter(settings.webhook_rate_per_minute)
     app.state.verify_slots = threading.BoundedSemaphore(settings.verify_concurrency)
     app.state.sweeper = asyncio.create_task(_sweep_forever(app, settings.process_interval_s))

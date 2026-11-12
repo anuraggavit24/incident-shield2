@@ -36,11 +36,13 @@ from .config import get_settings
 from .models import AppComplaint, AppPayment, AppUser, PaymentEvent
 from .paypal_client import PayPalClient, PayPalError
 from .risk import service
-from .risk.claims import extract_claims
+from .risk.brief import write_brief
+from .risk.claims import extract_claims, queue_priority
 from .risk.complaint import consistency
 from .risk.engine import decide
 from .risk.evidence import build_evidence, fingerprint_hash, sanitize_simulated
 from .risk.learning import gap_report, rescore_payers, scam_library
+from .risk.reference_ai import read_reference
 from .risk.snapshot import SnapshotError
 
 log = logging.getLogger("incident_shield.payapp")
@@ -77,6 +79,7 @@ class SlidingLimit:
 
 
 signup_limit = SlidingLimit(30)
+reference_ai_limit = SlidingLimit(12)  # AI reads of payment references per minute (free-tier budget)
 SIGNUPS_PER_ADDRESS_PER_MINUTE = 4
 _signup_by_address: dict[str, SlidingLimit] = {}
 
@@ -392,6 +395,10 @@ def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(c
     now = clock()
     ip_hash = ip_digest(client_ip(request))
     simulated = sanitize_simulated(body.simulated) if settings.simulation_enabled else {}
+    # AI job 1: read the reference for scam language the keyword list misses. Network call, so it runs
+    # before the database transaction. It can only add a signal.
+    fast_llm = getattr(request.app.state, "llm_fast", None)
+    ref_read = read_reference(fast_llm, body.reference, allow_call=fast_llm is None or reference_ai_limit.allow())
     with db.session_scope() as session:
         payer = session.get(AppUser, user_id)
         payee = session.scalar(select(AppUser).where(AppUser.handle == handle))
@@ -424,6 +431,9 @@ def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(c
             now=now,
             high_value_usd=settings.high_value_usd,
         )
+        evidence["ai_reference_read"] = {"status": ref_read["status"], **ref_read["values"]}
+        if ref_read["flagged"]:
+            evidence["reference_flagged_by_ai"] = True
         decision = decide(evidence)
         action = decision["action"]
         status = {
@@ -460,6 +470,7 @@ def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(c
         )
         payment_id = payment.id
         summary = _decision_summary(decision, evidence.get("simulated_fields", []))
+        summary["ai_reference_read"] = evidence["ai_reference_read"]
         release_at = payment.release_at
 
     response: dict[str, Any] = {
@@ -653,13 +664,15 @@ def file_complaint(
         "standard_review": "in_review",
         "manual_review_possible_first_party_abuse": "manual_review",
     }[result["outcome"]]
+    # AI job 3: the AI's reading can move the case up the reviewer's queue (never down, never decide).
+    priority = queue_priority(result["consistency_score"], result["outcome"], values)
     with db.session_scope() as session:
         complaint = AppComplaint(
             payment_id=payment_id,
             payer_id=user_id,
             claim=body.claim,
             text=text,
-            claims={**values, "_status": claims["status"], "_prompt": "claims-v1"},
+            claims={**values, "_status": claims["status"], "_prompt": "claims-v2", "_priority": priority},
             result=result,
             status=status,
             created_at=now,
@@ -671,7 +684,13 @@ def file_complaint(
             payment_id,
             "payer",
             "complaint_filed",
-            {"claim": body.claim, "consistency": result["consistency_score"], "outcome": result["outcome"]},
+            {
+                "claim": body.claim,
+                "consistency": result["consistency_score"],
+                "outcome": result["outcome"],
+                "queue_priority": priority["priority"],
+                "ai_priority_bonus": priority["ai_bonus"],
+            },
         )
         complaint_id = complaint.id
     return {
@@ -714,6 +733,7 @@ def _case(session: Session, p: AppPayment) -> dict[str, Any]:
             "text": complaint.text,  # untrusted: show as text only
             "ai_read_claims": {k: v for k, v in complaint.claims.items() if not k.startswith("_")},
             "ai_status": complaint.claims.get("_status"),
+            "queue_priority": complaint.claims.get("_priority"),
             "consistency": complaint.result,
             "filed_at": complaint.created_at.isoformat(),
         }
@@ -732,7 +752,11 @@ def review_queue() -> dict[str, Any]:
             .order_by(AppComplaint.id)
         ).all()
         recent = session.scalars(select(AppPayment).order_by(AppPayment.id.desc()).limit(25)).all()
-        priority = {"fast_tracked": 0, "in_review": 1, "manual_review": 2}
+
+        def rank(c: AppComplaint) -> tuple[int, int]:
+            pr = (c.claims.get("_priority") or {}).get("priority", c.result.get("consistency_score", 0))
+            return (-int(pr), c.id)  # highest priority first, then oldest
+
         return {
             "held_payments": [_payment_out(session, p) for p in held],
             "open_complaints": [
@@ -742,9 +766,12 @@ def review_queue() -> dict[str, Any]:
                     "status": c.status,
                     "claim": c.claim,
                     "consistency_score": c.result.get("consistency_score"),
+                    "queue_priority": (c.claims.get("_priority") or {}).get("priority"),
+                    "ai_priority_bonus": (c.claims.get("_priority") or {}).get("ai_bonus", 0),
+                    "ai_priority_reasons": (c.claims.get("_priority") or {}).get("ai_reasons", []),
                     "filed_at": c.created_at.isoformat(),
                 }
-                for c in sorted(open_complaints, key=lambda c: (priority[c.status], c.id))
+                for c in sorted(open_complaints, key=rank)
             ],
             "recent_payments": [_payment_out(session, p) for p in recent],
         }
@@ -758,6 +785,19 @@ def review_case(payment_id: int) -> dict[str, Any]:
         if p is None:
             raise HTTPException(status_code=404, detail="payment not found")
         return _case(session, p)
+
+
+@router.post("/review/payments/{payment_id}/brief", dependencies=[Depends(require_owner)])
+def review_brief(payment_id: int, request: Request) -> dict[str, Any]:
+    """AI job 2: a short brief written from code-built facts and checked by code. A brief with a number that
+    isn't in the facts, or wording that decides the case, is replaced by a plain template."""
+    _ring_or_503()
+    with db.session_scope() as session:
+        p = session.get(AppPayment, payment_id)
+        if p is None:
+            raise HTTPException(status_code=404, detail="payment not found")
+        case = _case(session, p)
+    return write_brief(request.app.state.llm, case)
 
 
 @router.post("/review/payments/{payment_id}/release", dependencies=[Depends(require_owner)])
