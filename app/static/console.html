@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Incident Shield</title><link rel="stylesheet" href="/static/console.css"></head>
+<body><div class="shell">
+<aside class="side" id="side" aria-label="Main navigation">
+  <div class="brand">Incident Shield<small>Payment protection</small></div>
+  <nav class="nav" id="nav"></nav>
+</aside>
+<div class="main">
+  <div class="top">
+    <div><button class="btn sec sm menu" id="menu" aria-label="Open navigation">Menu</button> <span class="crumb">Incident Shield / <b id="crumb">Overview</b></span></div>
+    <div class="chips"><span class="chip env" id="chip-env">PayPal sandbox</span><span class="chip mode" id="chip-mode"></span><span class="chip" id="chip-user">not signed in</span></div>
+  </div>
+  <main class="page" id="page" tabindex="-1"></main>
+</div></div>
+<aside class="drawer hide" id="drawer" aria-label="Details"><header><h2 id="drawer-title">Details</h2><button class="btn sec sm" id="drawer-close">Close</button></header><div id="drawer-body"></div></aside>
+<dialog id="ask"><h3 id="ask-title"></h3><p class="mute" id="ask-text"></p><input id="ask-input" autocomplete="off"><p class="row sp"><button class="btn" id="ask-ok">OK</button><button class="btn sec" id="ask-cancel">Cancel</button></p></dialog>
+<div class="toast hide" id="toast" role="status" aria-live="polite"></div>
+<script src="/static/console.js"></script></body></html>

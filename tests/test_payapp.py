@@ -1744,3 +1744,144 @@ def test_f09_cancel_cannot_overwrite_a_capture_in_progress(world) -> None:
         assert not s.scalar(
             select(PaymentEvent.id).where(PaymentEvent.payment_id == pid, PaymentEvent.action == "cancelled")
         )
+
+
+# --------------------------------------------------------------------------- monitor mode, AI watch, public demo
+
+
+def with_settings(monkeypatch, **changes):
+    from app.config import get_settings
+
+    real = get_settings()
+    monkeypatch.setattr(payapp, "get_settings", lambda: type(real)(**{**real.__dict__, **changes}))
+
+
+def test_monitor_mode_scores_and_seals_but_does_not_stop_the_payment(world, monkeypatch) -> None:
+    with_settings(monkeypatch, enforcement="monitor")
+    alice = regular_payer(world)
+    r = pay(world, alice, "carol", 45, name="Carol", ref="move to safe account", sim={"active_call": True}).json()
+    assert r["engine_action"] == "hold_review" and r["action"] == "allow" and r["status"] == "awaiting_approval"
+    assert r["decision"]["score"] >= 70 and r["approve_url"].startswith("https://www.sandbox.paypal.com/")
+    assert len(world.paypal.called("create_order")) == 1  # the payment went on to PayPal
+    with db.session_scope() as s:
+        snap = service.open_decision(s.scalar(select(RiskDecision).order_by(RiskDecision.id.desc())))
+    assert snap["decision"]["action"] == "hold_review"  # what the engine decided is what is sealed
+    assert snap["evidence"]["applied_action"] == "allow" and snap["evidence"]["enforcement"] == "monitor"
+    world.post(f"/app/payments/{r['payment_id']}/capture", headers=alice)
+    c = world.post(f"/app/payments/{r['payment_id']}/complaint", headers=alice, json={"claim": "scam"}).json()
+    assert c["status"] == "fast_tracked"  # the stored record makes the later complaint quick to assess
+
+
+def test_ai_watch_starts_on_a_risky_score_and_pauses_the_account_when_too_much_leaves(world, monkeypatch) -> None:
+    with_settings(monkeypatch, enforcement="monitor", watch_outflow_usd=100, watch_score=30)
+    alice = regular_payer(world)
+    calm = pay(world, alice, "bob", 20, name="Bob").json()
+    assert calm["watch"] is None  # a low score starts nothing
+    risky = pay(world, alice, "carol", 45, name="Carol", ref="move to safe account", sim={"active_call": True}).json()
+    assert risky["action"] == "allow" and risky["watch"] == {"on_watch": True, "money_out": "45.00", "limit": 100}
+    second = pay(world, alice, "carol", 40, name="Carol").json()
+    assert second["action"] == "allow" and second["watch"]["money_out"] == "85.00"  # still under the limit
+    third = pay(world, alice, "carol", 30, name="Carol").json()
+    assert third["action"] == "watch_stop" and third["status"] == "held" and "paused" in third["message"]
+    assert len(world.paypal.called("create_order")) == 3  # the stopped one never reached PayPal
+    w = world.get("/review/watch", headers=OWNER).json()
+    assert w["enabled"] is True and len(w["accounts"]) == 1
+    a = w["accounts"][0]
+    assert (a["account"], a["stopped"], a["money_out_since"], a["trigger_score"]) == (
+        "alice",
+        True,
+        "85.00",
+        risky["decision"]["score"],
+    )
+    assert (
+        a["where_it_went"][0]["account"] == "carol"
+        and a["where_it_went"][0]["received_from_watched_account"] == "85.00"
+    )
+    with db.session_scope() as s:
+        crawl = s.scalar(select(PaymentEvent).where(PaymentEvent.action == "watch_stopped")).details
+    assert crawl["where_it_went"][0]["account"] == "carol"
+    # the AI answers about the watched account from the crawler's facts, and is checked
+    world.app_state.llm = FakeLLM({"answer": "The account sent $85.00 to @carol after a payment scored 70."})
+    ok = world.post("/review/watch/alice/ask", headers=OWNER, json={"question": "Where did the money go?"}).json()
+    assert ok["source"] == "ai_checked"
+    world.app_state.llm = FakeLLM({"answer": "The customer is clearly a victim and lost $9,000."})
+    assert (
+        world.post("/review/watch/alice/ask", headers=OWNER, json={"question": "Verdict?"}).json()["source"] == "facts"
+    )
+    # a reviewer ends the watch: the next payment goes through again, and the action is audited
+    assert world.post("/review/watch/alice/clear", headers=OWNER).json()["status"] == "cleared"
+    assert pay(world, alice, "bob", 20, name="Bob").json()["action"] == "allow"
+    assert world.get("/review/watch", headers=OWNER).json()["accounts"] == []
+    assert world.get("/review/audit", headers=OWNER).json()["actions"][0]["action"] == "watch_cleared"
+    assert world.post("/review/watch/nobody/clear", headers=OWNER).status_code == 404
+
+
+def test_watch_is_off_by_default_and_expires(world, monkeypatch) -> None:
+    alice = regular_payer(world)
+    r = pay(world, alice, "carol", 45, name="Carol", ref="move to safe account", sim={"active_call": True}).json()
+    assert r["watch"] is None and world.get("/review/watch", headers=OWNER).json()["enabled"] is False
+    with_settings(monkeypatch, enforcement="monitor", watch_outflow_usd=50, watch_hours=1)
+    pay(world, alice, "carol", 45, name="Carol", ref="release fee", sim={"active_call": True})
+    world.now["t"] = T0 + timedelta(hours=2)
+    later = pay(world, alice, "bob", 40, name="Bob").json()
+    assert later["action"] == "allow" and later["watch"] is None  # the watch window has passed
+
+
+def test_public_demo_mode_opens_reviewer_screens_as_judge_and_is_off_by_default(world, monkeypatch) -> None:
+    assert world.get("/review/overview").status_code == 401 and world.get("/app/config").json()["public_demo"] is False
+    monkeypatch.setenv("PUBLIC_DEMO", "true")
+    assert world.get("/app/config").json()["public_demo"] is True
+    alice, pid = captured_scam_payment(world)
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    assert world.get("/review/queue").status_code == 200  # no key at all
+    done = world.post(f"/review/complaints/{cid}/approve", json={"confirm_amount": "45.00"})
+    assert done.status_code == 200 and done.json()["status"] == "refunded"
+    assert world.get("/review/audit").json()["actions"][0]["by"] == "judge"
+    assert world.get("/metrics").status_code == 200
+    assert world.get(f"/app/payments/{pid}").status_code == 401  # a payer's own pages still need their token
+
+
+def test_console_data_endpoints(world) -> None:
+    alice = regular_payer(world)
+    held = pay(world, alice, "carol", 45, name="Carol", ref="move to safe account", sim={"active_call": True}).json()
+    ok = pay(world, alice, "bob", 20, name="Bob").json()
+    o = world.get("/review/overview", headers=OWNER).json()
+    assert (o["total_payments"], o["flagged_payments"], o["payments_on_hold"], o["funds_on_hold"]) == (2, 1, 1, "45.00")
+    assert (
+        o["risk_distribution"]["hold_review"] == 1 and o["risk_distribution"]["allow"] == 1 and o["sealed_records"] == 2
+    )
+    assert o["last_7_days"][-1] == {"day": T0.date().isoformat(), "payments": 2, "flagged": 1}
+    tx = world.get("/review/transactions", headers=OWNER).json()["transactions"]
+    assert [(t["id"], t["payer"], t["engine_action"]) for t in tx] == [
+        (ok["payment_id"], "alice", "allow"),
+        (held["payment_id"], "alice", "hold_review"),
+    ]
+    sealed = world.get(f"/app/payments/{held['payment_id']}/sealed", headers=alice).json()
+    assert len(sealed["this_record_hash"]) == 64 and "score" in sealed["inside_encrypted"]
+    assert "safe account" not in str(sealed) and "hold_review" not in str(sealed)
+    assert world.get(f"/app/payments/{held['payment_id']}/sealed", headers=signup(world, "mallory")).status_code == 404
+    world.app_state.llm = FakeLLM({"answer": "The payment of $45.00 scored 70 out of 100 and was held for review."})
+    a = world.post(
+        f"/review/payments/{held['payment_id']}/ask", headers=OWNER, json={"question": "Why was it held?"}
+    ).json()
+    assert a["source"] == "ai_checked"
+    world.app_state.llm = FakeLLM({"answer": "You should approve the refund."})
+    assert (
+        world.post(f"/review/payments/{held['payment_id']}/ask", headers=OWNER, json={"question": "x y z"}).json()[
+            "source"
+        ]
+        == "facts"
+    )
+    world.app_state.llm = None
+    assert (
+        world.post(f"/review/payments/{held['payment_id']}/ask", headers=OWNER, json={"question": "Why?"}).json()[
+            "source"
+        ]
+        == "facts"
+    )
+    assert world.post(f"/review/payments/{held['payment_id']}/ask", json={"question": "Why?"}).status_code == 401
+    page = world.get("/app")
+    assert (
+        page.status_code == 200 and "/static/console.js" in page.text and world.get("/app/classic").status_code == 200
+    )
+    assert world.get("/static/console.js").status_code == 200 and world.get("/static/console.css").status_code == 200

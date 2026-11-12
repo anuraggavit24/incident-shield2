@@ -175,6 +175,12 @@ PAGE_HEADERS = {
 
 
 @app.get("/app", include_in_schema=False)
+def console_page() -> FileResponse:
+    """The tabbed console: paying, cases, AI watch, evidence, audit. One page for payer and reviewer."""
+    return FileResponse(STATIC_DIR / "console.html", headers=PAGE_HEADERS)
+
+
+@app.get("/app/classic", include_in_schema=False)
 def checkout_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "checkout.html", headers=PAGE_HEADERS)
 

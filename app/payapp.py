@@ -37,7 +37,7 @@ from .config import get_settings
 from .models import AppComplaint, AppPayment, AppUser, PaymentEvent, RiskDecision, SharedDevice
 from .paypal_client import PayPalClient, PayPalError
 from .risk import model, service
-from .risk.brief import write_brief
+from .risk.brief import answer_from_facts, build_facts, write_brief
 from .risk.claims import extract_claims, queue_priority
 from .risk.complaint import consistency
 from .risk.engine import decide
@@ -248,7 +248,70 @@ MESSAGES = {
     ),
     "hold_review": "This payment is on hold while our team reviews it. No money has moved.",
     "block": "This payment was blocked. No money has moved.",
+    "watch_stop": (
+        "This account is being watched after an unusual payment, and too much money has gone out since. "
+        "Payments are paused until a reviewer has looked. No money has moved for this one."
+    ),
 }
+WATCH_OUT = ("captured", "awaiting_approval", "scored", "capturing")  # money gone, or cleared to go
+
+
+def _watch_state(session: Session, payer_id: int, now: datetime, settings: Any) -> dict[str, Any] | None:
+    """Is this payer on watch, and how much has gone out since? A watch starts when a payment scores at or
+    above WATCH_SCORE and lasts WATCH_HOURS, unless a reviewer clears it."""
+    since = now - timedelta(hours=settings.watch_hours)
+    mine = (
+        select(PaymentEvent.action, PaymentEvent.details, AppPayment.created_at, AppPayment.id)
+        .join(AppPayment, AppPayment.id == PaymentEvent.payment_id)
+        .where(AppPayment.payer_id == payer_id, PaymentEvent.action.in_(("watch_started", "watch_cleared")))
+        .order_by(PaymentEvent.id)
+    )
+    start, trigger, first_id = None, {}, 0
+    for action, details, created, payment_id in session.execute(mine):
+        if action == "watch_cleared":
+            start, trigger = None, {}
+        elif start is None and created >= since:
+            start, trigger, first_id = created, details, payment_id
+    if start is None:
+        return None
+    rows = session.execute(
+        select(AppPayment.id, AppPayment.payee_id, AppPayment.amount, AppPayment.status, AppPayment.created_at).where(
+            AppPayment.payer_id == payer_id,
+            AppPayment.id >= first_id,  # the triggering payment and later
+        )
+    ).all()
+    out = sum((r.amount for r in rows if r.status in WATCH_OUT), Decimal("0"))
+    return {"since": start, "trigger": trigger, "outflow": out, "payments": rows}
+
+
+def _crawl(session: Session, payer: AppUser, state: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """The "crawler": follow the money that left a watched account. For each account it paid: how much, what
+    that account then did, and what the payments graph says about it."""
+    names = dict(session.execute(select(AppUser.id, AppUser.handle)).all())
+    per_payee: dict[int, Decimal] = {}
+    for r in state["payments"]:
+        if r.status in WATCH_OUT:
+            per_payee[r.payee_id] = per_payee.get(r.payee_id, Decimal("0")) + r.amount
+    trail = []
+    for payee_id, total in sorted(per_payee.items(), key=lambda kv: -kv[1]):
+        hood = neighbourhood(session, names[payee_id], now) or {}
+        trail.append(
+            {
+                "account": names[payee_id],
+                "received_from_watched_account": f"{total:.2f}",
+                "then_paid": [f"@{x['account']} ${x['total']:.2f}" for x in hood.get("paid_to", [])],
+                "findings": [f"{f['finding'].replace('_', ' ')}: {f['detail']}" for f in hood.get("findings", [])],
+            }
+        )
+    return {
+        "account": payer.handle,
+        "on_watch_since": state["since"].isoformat(),
+        "trigger_score": state["trigger"].get("score"),
+        "trigger_reasons": state["trigger"].get("reasons", []),
+        "money_out_since": f"{state['outflow']:.2f}",
+        "payments_since": len(state["payments"]),
+        "where_it_went": trail,
+    }
 
 
 def _payment_out(session: Session, p: AppPayment, with_events: bool = False) -> dict[str, Any]:
@@ -482,8 +545,24 @@ def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(c
         if shadow is not None:
             evidence["shadow_model"] = shadow
         scoring_ms = int((time.monotonic() - started) * 1000)
-        action = decision["action"]
+        engine_action = decision["action"]
+        action = engine_action
+        # The watch: after a risky payment the account is watched, and it is stopped only when too much money
+        # has gone out since. This works in both modes and is the one thing that stops a payment in monitor mode.
+        watching = settings.watch_outflow_usd > 0
+        watch = _watch_state(session, payer.id, now, settings) if watching else None
+        watch_note: dict[str, Any] | None = None
+        if watch is not None:
+            going = watch["outflow"] + amount
+            watch_note = {"on_watch": True, "money_out": f"{going:.2f}", "limit": settings.watch_outflow_usd}
+            if going > Decimal(settings.watch_outflow_usd):
+                action = "watch_stop"
+        if action != "watch_stop" and settings.enforcement == "monitor" and engine_action != "allow":
+            action = "allow"  # monitor mode: score, seal and record; don't stop the payment
+        evidence["applied_action"] = action
+        evidence["enforcement"] = settings.enforcement
         status = {
+            "watch_stop": "held",
             "allow": "scored",
             "step_up": "awaiting_confirmation",
             "warn_and_delay": "delayed",
@@ -517,10 +596,23 @@ def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(c
                 "score": decision["score"],
                 "band": decision["band"],
                 "action": action,
+                "engine_action": engine_action,
                 "decision_id": sealed.id,
                 "scoring_ms": scoring_ms,
             },
         )
+        if watching and watch is None and decision["score"] >= settings.watch_score:
+            add_event(
+                session,
+                payment.id,
+                "system",
+                "watch_started",
+                {"score": decision["score"], "reasons": decision["reason_codes"], "hours": settings.watch_hours},
+            )
+            watch_note = {"on_watch": True, "money_out": f"{amount:.2f}", "limit": settings.watch_outflow_usd}
+        if action == "watch_stop" and watch is not None:
+            watch["payments"] = [*watch["payments"]]
+            add_event(session, payment.id, "system", "watch_stopped", _crawl(session, payer, watch, now))
         payment_id = payment.id
         summary = _decision_summary(decision, evidence.get("simulated_fields", []))
         summary["ai_reference_read"] = evidence["ai_reference_read"]
@@ -532,6 +624,9 @@ def create_payment(body: PaymentBody, request: Request, user_id: int = Depends(c
         "action": action,
         "message": MESSAGES[action],
         "release_at": release_at.isoformat() if release_at else None,
+        "engine_action": engine_action,
+        "enforcement": settings.enforcement,
+        "watch": watch_note,
     }
     if settings.simulation_enabled:  # a real service wouldn't show attackers the score
         response["decision"] = summary
@@ -1466,3 +1561,234 @@ def reconcile(request: Request, limit: int = Query(default=10, ge=1, le=25)) -> 
         if problems:
             mismatches.append({"payment_id": pid, "problem": "; ".join(problems)})
     return {"checked": checked, "mismatches": mismatches, "ok": not mismatches}
+
+
+# --------------------------------------------------------------------------- console (the tabbed interface)
+
+
+@router.get("/app/config")
+def app_config() -> dict[str, Any]:
+    """What the page needs to know before anyone signs in. No secrets."""
+    from .auth import public_demo
+
+    settings = get_settings()
+    return {
+        "public_demo": public_demo(),
+        "simulation": settings.simulation_enabled,
+        "enforcement": settings.enforcement,
+        "watch_score": settings.watch_score,
+        "watch_outflow_usd": settings.watch_outflow_usd,
+        "watch_hours": settings.watch_hours,
+        "refund_second_approval_usd": settings.refund_second_approval_usd,
+        "environment": "PayPal sandbox",
+    }
+
+
+@router.get("/app/payments/{payment_id}/sealed")
+def sealed_record(payment_id: int, user_id: int = Depends(current_payer)) -> dict[str, Any]:
+    """What is actually stored for this payment's decision: ciphertext, hashes and a signature. The payer can
+    see that a record exists and is chained; they can't read it. Only the server's key opens it."""
+    with db.session_scope() as session:
+        p = session.get(AppPayment, payment_id)
+        if p is None or p.payer_id != user_id:
+            raise HTTPException(status_code=404, detail="payment not found")
+        row = service.decision_for(session, payment_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no sealed decision for this payment")
+        return {
+            "record_number": row.id,
+            "key_id": row.key_id,
+            "previous_record_hash": row.prev_hash,
+            "this_record_hash": row.record_hash,
+            "signature": row.signature,
+            "nonce": row.nonce,
+            "ciphertext_preview": row.ciphertext[:160] + "…",
+            "ciphertext_bytes": len(row.ciphertext) // 2,
+            "inside_encrypted": [
+                "score",
+                "action",
+                "signals fired",
+                "reason codes",
+                "all evidence used",
+                "time sealed",
+            ],
+            "how": "AES-256-GCM encryption, HMAC-SHA256 signature, SHA-256 chain to the previous record",
+        }
+
+
+def _scored(session: Session, since: datetime | None = None) -> dict[int, dict[str, Any]]:
+    q = select(PaymentEvent.payment_id, PaymentEvent.details).where(PaymentEvent.action == "scored")
+    if since is not None:
+        q = q.where(PaymentEvent.at >= since)
+    return {pid: d for pid, d in session.execute(q)}
+
+
+@router.get("/review/transactions", dependencies=[Depends(require_reviewer)])
+def review_transactions(limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
+    with db.session_scope() as session:
+        rows = session.scalars(
+            select(AppPayment).where(AppPayment.seeded.is_(False)).order_by(AppPayment.id.desc()).limit(limit)
+        ).all()
+        scored = _scored(session)
+        names = dict(session.execute(select(AppUser.id, AppUser.handle)).all())
+        return {
+            "transactions": [
+                {
+                    **_payment_out(session, p),
+                    "payer": names.get(p.payer_id),
+                    "score": scored.get(p.id, {}).get("score"),
+                    "band": scored.get(p.id, {}).get("band"),
+                    "engine_action": scored.get(p.id, {}).get("engine_action", scored.get(p.id, {}).get("action")),
+                    "applied_action": scored.get(p.id, {}).get("action"),
+                }
+                for p in rows
+            ]
+        }
+
+
+@router.get("/review/overview", dependencies=[Depends(require_reviewer)])
+def review_overview() -> dict[str, Any]:
+    """Figures for the overview tab, all from stored data. Seeded demo-history rows are excluded."""
+    now = clock()
+    with db.session_scope() as session:
+        rows = session.execute(
+            select(AppPayment.id, AppPayment.amount, AppPayment.status, AppPayment.created_at).where(
+                AppPayment.seeded.is_(False)
+            )
+        ).all()
+        scored = _scored(session)
+        open_complaints = session.scalar(
+            select(func.count(AppComplaint.id)).where(AppComplaint.status.in_(OPEN_COMPLAINTS))
+        )
+        bands = {"allow": 0, "step_up": 0, "hold_review": 0, "block": 0}
+        for d in scored.values():
+            if d.get("band") in bands:
+                bands[d["band"]] += 1
+        days = []
+        for back in range(6, -1, -1):
+            day = (now - timedelta(days=back)).date()
+            todays = [r for r in rows if r.created_at.date() == day]
+            days.append(
+                {
+                    "day": day.isoformat(),
+                    "payments": len(todays),
+                    "flagged": sum(1 for r in todays if (scored.get(r.id, {}).get("score") or 0) >= 30),
+                }
+            )
+        held = [r for r in rows if r.status == "held"]
+        return {
+            "total_payments": len(rows),
+            "flagged_payments": sum(1 for d in scored.values() if (d.get("score") or 0) >= 30),
+            "funds_on_hold": f"{sum((r.amount for r in held), Decimal('0')):.2f}",
+            "payments_on_hold": len(held),
+            "open_cases": open_complaints or 0,
+            "refunded": f"{sum((r.amount for r in rows if r.status == 'refunded'), Decimal('0')):.2f}",
+            "sealed_records": session.scalar(select(func.count(RiskDecision.id))),
+            "risk_distribution": bands,
+            "last_7_days": days,
+        }
+
+
+def _watch_rows(session: Session, now: datetime) -> list[dict[str, Any]]:
+    settings = get_settings()
+    payer_ids = set(
+        session.scalars(
+            select(AppPayment.payer_id)
+            .join(PaymentEvent, PaymentEvent.payment_id == AppPayment.id)
+            .where(PaymentEvent.action == "watch_started")
+        )
+    )
+    out = []
+    for payer_id in sorted(payer_ids):
+        state = _watch_state(session, payer_id, now, settings)
+        payer = session.get(AppUser, payer_id)
+        if state is None or payer is None:
+            continue
+        report = _crawl(session, payer, state, now)
+        report["limit"] = settings.watch_outflow_usd
+        report["stopped"] = any(r.status == "held" for r in state["payments"])
+        out.append(report)
+    return out
+
+
+@router.get("/review/watch", dependencies=[Depends(require_reviewer)])
+def review_watch() -> dict[str, Any]:
+    """Accounts being watched after a risky payment, the money that has left each since, and where it went."""
+    settings = get_settings()
+    with db.session_scope() as session:
+        return {
+            "enabled": settings.watch_outflow_usd > 0,
+            "watch_score": settings.watch_score,
+            "outflow_limit_usd": settings.watch_outflow_usd,
+            "hours": settings.watch_hours,
+            "accounts": _watch_rows(session, clock()),
+        }
+
+
+def _watch_facts(report: dict[str, Any]) -> list[str]:
+    facts = [
+        f"Account @{report['account']} has been on watch since {report['on_watch_since'][:16]} after a payment "
+        f"scored {report['trigger_score']} out of 100.",
+        f"Since then ${report['money_out_since']} has gone out in {report['payments_since']} payment attempts; "
+        f"the limit is ${report['limit']}.",
+        "Payments from this account are now paused." if report["stopped"] else "Payments are not paused.",
+    ]
+    for hop in report["where_it_went"]:
+        line = f"@{hop['account']} received ${hop['received_from_watched_account']}"
+        if hop["then_paid"]:
+            line += ", then paid " + ", ".join(hop["then_paid"])
+        if hop["findings"]:
+            line += ". Graph findings: " + "; ".join(hop["findings"])
+        facts.append(line + ".")
+    return facts
+
+
+class AskBody(BaseModel):
+    question: str = Field(min_length=3, max_length=300)
+
+
+@router.post("/review/watch/{handle}/ask", dependencies=[Depends(require_reviewer)])
+def watch_ask(handle: str, body: AskBody, request: Request) -> dict[str, Any]:
+    """Ask the AI about one watched account. It answers from the crawler's facts only, and is checked."""
+    with db.session_scope() as session:
+        report = next((r for r in _watch_rows(session, clock()) if r["account"] == handle.strip().lower()), None)
+    if report is None:
+        raise HTTPException(status_code=404, detail="that account is not on watch")
+    return answer_from_facts(request.app.state.llm, _watch_facts(report), body.question)
+
+
+@router.post("/review/watch/{handle}/clear")
+def watch_clear(handle: str, by: str = Depends(require_reviewer)) -> dict[str, str]:
+    """A reviewer has looked: end the watch. Held payments stay held until released or declined one by one."""
+    _ring_or_503()
+    with db.session_scope() as session:
+        user = session.scalar(select(AppUser).where(AppUser.handle == handle.strip().lower()))
+        last = user and session.scalar(
+            select(AppPayment.id).where(AppPayment.payer_id == user.id).order_by(AppPayment.id.desc()).limit(1)
+        )
+        if not last:
+            raise HTTPException(status_code=404, detail="that account is not on watch")
+        add_event(session, last, "reviewer", "watch_cleared", {"by": by, "account": user.handle})
+    return {"status": "cleared", "account": handle.strip().lower()}
+
+
+@router.post("/review/payments/{payment_id}/ask")
+def case_ask(payment_id: int, body: AskBody, request: Request, by: str = Depends(require_reviewer)) -> dict[str, Any]:
+    """A conversation about one case. Every answer is built from the case's facts (the sealed decision, the
+    complaint, the consistency checks) and checked: an invented number or a verdict, and the facts are shown
+    instead. The AI can't approve, decline or move money."""
+    _ring_or_503()
+    with db.session_scope() as session:
+        p = session.get(AppPayment, payment_id)
+        if p is None:
+            raise HTTPException(status_code=404, detail="payment not found")
+        audit.record(
+            session, by, "case_read", f"payment:{payment_id}", {"payment_id": payment_id, "via": "ask"}, utcnow()
+        )
+        case = _case(session, p)
+    facts = build_facts(case)
+    if case.get("complaint", {}).get("text"):
+        facts.append("The customer wrote: " + case["complaint"]["text"][:400].replace("<", "(").replace(">", ")"))
+    for e in case.get("timeline", [])[-8:]:
+        facts.append(f"Timeline: {e['action'].replace('_', ' ')} by {e['actor']} at {e['at'][:16]}.")
+    return answer_from_facts(request.app.state.llm, facts, body.question)

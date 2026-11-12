@@ -61,6 +61,13 @@ def owner_key_expired() -> bool:
         return True
 
 
+def public_demo() -> bool:
+    """PUBLIC_DEMO=true opens the reviewer and owner screens to anyone, with no key, as the user "judge".
+    For a sandbox demonstration ONLY: anyone who finds the site can read every case and approve refunds
+    (which still only go back to the original payer, through the sandbox). Never set it with real data."""
+    return os.getenv("PUBLIC_DEMO", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _is_owner(key: str | None) -> bool:
     if not key or owner_key_expired():
         return False
@@ -68,12 +75,14 @@ def _is_owner(key: str | None) -> bool:
 
 
 def require_owner(x_api_key: str | None = Security(api_key_header)) -> None:
+    if public_demo():
+        return
     if not _is_owner(x_api_key):
         raise HTTPException(status_code=401, detail="invalid API key")
 
 
 def require_reviewer(x_api_key: str | None = Security(api_key_header)) -> str:
-    """Returns who is acting: "owner" or a reviewer's name."""
+    """Returns who is acting: "owner", a reviewer's name, or "judge" in public demo mode."""
     if _is_owner(x_api_key):
         return "owner"
     if x_api_key:
@@ -81,4 +90,6 @@ def require_reviewer(x_api_key: str | None = Security(api_key_header)) -> str:
         found = [name for name, expected in reviewers().items() if hmac.compare_digest(digest, expected)]
         if found:
             return found[0]
+    if public_demo():
+        return "judge"
     raise HTTPException(status_code=401, detail="invalid API key")

@@ -58,3 +58,9 @@ services:
         value: "true"
       - key: REVIEWERS
         sync: false  # optional: name:sha256,name:sha256 from scripts/make_reviewer_key.py
+      - key: ENFORCEMENT
+        value: monitor  # score, seal and record; don't stop payments on the score ("enforce" to let it act)
+      - key: WATCH_OUTFLOW_USD
+        value: "150"  # AI watch: pause a watched account once this much has gone out (0 = off)
+      - key: PUBLIC_DEMO
+        value: "true"  # SANDBOX DEMO ONLY: reviewer screens open to everyone, no key. Remove after judging.

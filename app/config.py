@@ -77,6 +77,10 @@ class Settings:
     high_value_usd: int = 250
     step_up_delay_minutes: int = 2
     max_users: int = 3000
+    enforcement: str = "enforce"  # "enforce": the score can stop a payment. "monitor": score and seal only
+    watch_score: int = 30  # a payment scoring this or more puts the payer on watch
+    watch_outflow_usd: int = 0  # while on watch, stop once this much has gone out. 0 = watch feature off
+    watch_hours: int = 24
     reviewer_refund_limit_usd: int = 500  # a named reviewer can't approve more than this; the owner must
     scoring_target_ms: int = 800  # service target for one scoring decision (reported in /metrics)
     refund_second_approval_usd: int = 100  # refunds of this much or more need two different reviewers
@@ -113,6 +117,10 @@ def get_settings() -> Settings:
         high_value_usd=int(os.getenv("HIGH_VALUE_USD", "250")),
         step_up_delay_minutes=int(os.getenv("STEP_UP_DELAY_MINUTES", "2")),
         max_users=int(os.getenv("MAX_USERS", "3000")),
+        enforcement="monitor" if os.getenv("ENFORCEMENT", "").strip().lower() == "monitor" else "enforce",
+        watch_score=int(os.getenv("WATCH_SCORE", "30")),
+        watch_outflow_usd=int(os.getenv("WATCH_OUTFLOW_USD", "0")),
+        watch_hours=int(os.getenv("WATCH_HOURS", "24")),
         reviewer_refund_limit_usd=int(os.getenv("REVIEWER_REFUND_LIMIT_USD", "500")),
         scoring_target_ms=int(os.getenv("SCORING_TARGET_MS", "800")),
         refund_second_approval_usd=int(os.getenv("REFUND_SECOND_APPROVAL_USD", "100")),
