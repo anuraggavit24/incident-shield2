@@ -3,6 +3,17 @@
 **Simulated data, written by the authors of the rules. This is not real-world accuracy.**
 Reproduce with `python scripts/benchmark.py`. "Slowed" = anything but a straight allow (confirm payee, delay, hold, block). "Stopped" = held or blocked.
 
+## What to take from this
+
+- The engine slows or stops **53.8%** of the simulated fraud in the tuning set and **9.4%** in the held-out set.
+- **It misses these fraud types completely (0% slowed):** takeover patient, scam bland, mule careful, card testing. Each one stays just under a threshold or uses data the app doesn't have.
+- **The cost to honest users is concentrated:** 27.5% of "new phone new payee" payments are stopped outright, about one in four people who set up a new phone, reset their password and pay someone new. The overall false-positive rate (1.2%) hides this because that group is small.
+- No precision figure is given: it depends on the share of fraud in the mix, which here was chosen by hand and is far higher than in real traffic.
+
+## Tuning set
+
+Rules have been changed with these numbers in view, so they flatter the engine. One floor (`CONFIRMED_FRAUD_RECIPIENT`) was added because "known bad recipient" scored 15% here; its 100% now is the rule fitted to its own test, not evidence that the rule generalises.
+
 | Class | Scenario | Payments | Slowed | Stopped |
 |---|---|---|---|---|
 | legit | repeat | 560 | 0.0% | 0.0% |
@@ -25,12 +36,23 @@ Reproduce with `python scripts/benchmark.py`. "Slowed" = anything but a straight
 | fraud | card testing | 20 | 0.0% | 0.0% |
 | fraud | device farm | 20 | 100.0% | 100.0% |
 
-| Measure | Value |
-|---|---|
-| Fraud slowed or stopped (recall) | 53.8% of 275 |
-| Fraud stopped outright | 53.5% |
-| Legitimate payments slowed (false-positive rate) | 1.2% of 1000 |
-| Legitimate payments stopped | 1.2% |
-| Of everything slowed, share that was fraud (precision at this mix) | 92.5% |
+- Fraud slowed or stopped (recall): **53.8%** of 275; stopped outright: 53.5%
+- Legitimate payments slowed (false-positive rate): **1.2%** of 1000; stopped outright: 1.2%
 
-The mix is 275 fraud in 1275 payments, far more fraud than real traffic has, so the precision figure would be much lower in production.
+## Held-out set
+
+Written after the last rule change and scored once. No rule, threshold or floor may be changed because of this table; if the rules change, these scenarios are replaced.
+
+| Class | Scenario | Payments | Slowed | Stopped |
+|---|---|---|---|---|
+| legit | first rent | 40 | 0.0% | 0.0% |
+| legit | traveller | 40 | 0.0% | 0.0% |
+| legit | charity appeal | 40 | 0.0% | 0.0% |
+| legit | reset then big payment | 40 | 2.5% | 0.0% |
+| fraud | takeover small amounts | 40 | 0.0% | 0.0% |
+| fraud | scam from new phone | 40 | 37.5% | 0.0% |
+| fraud | mule aged account | 40 | 0.0% | 0.0% |
+| fraud | ring member | 40 | 0.0% | 0.0% |
+
+- Fraud slowed or stopped (recall): **9.4%** of 160; stopped outright: 0.0%
+- Legitimate payments slowed (false-positive rate): **0.6%** of 160; stopped outright: 0.0%

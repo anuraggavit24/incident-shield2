@@ -125,7 +125,7 @@ $("su-go").addEventListener("click", async () => {
   } catch (e) { $("su-err").textContent = e.message; }
 });
 $("demo-hist").addEventListener("click", async () => { try { await api("/app/demo/history", "POST", { device_id: deviceId }); await loadMe(); } catch (e) { alert(e.message); } });
-$("logout").addEventListener("click", async () => { try { await api("/app/logout", "POST"); } catch (e) { /* already out */ } token = null; store.set("is_token", ""); location.href = "/app"; });
+$("logout").addEventListener("click", async () => { if (!confirm("This demo has no passwords. If you log out you can NEVER get back into this account or see its payments again. Log out anyway?")) return; try { await api("/app/logout", "POST"); } catch (e) { /* already out */ } token = null; store.set("is_token", ""); location.href = "/app"; });
 $("new-device").addEventListener("click", () => { deviceId = newDeviceId(); $("device-line").textContent = "New device id: " + deviceId.slice(0, 8) + "…"; });
 $("chg-cred").addEventListener("click", async () => { try { await api("/app/me/credentials", "POST", { device_id: deviceId }); alert("Recorded: password changed from this device."); } catch (e) { alert(e.message); } });
 for (const [k, label] of Object.entries(SIM_FIELDS)) {

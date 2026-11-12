@@ -77,6 +77,7 @@ class Settings:
     high_value_usd: int = 250
     step_up_delay_minutes: int = 2
     max_users: int = 3000
+    refund_second_approval_usd: int = 100  # refunds of this much or more need two different reviewers
 
 
 def hash_api_key(raw: str) -> str:
@@ -110,4 +111,5 @@ def get_settings() -> Settings:
         high_value_usd=int(os.getenv("HIGH_VALUE_USD", "250")),
         step_up_delay_minutes=int(os.getenv("STEP_UP_DELAY_MINUTES", "2")),
         max_users=int(os.getenv("MAX_USERS", "3000")),
+        refund_second_approval_usd=int(os.getenv("REFUND_SECOND_APPROVAL_USD", "100")),
     )

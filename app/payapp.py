@@ -42,6 +42,7 @@ from .risk.claims import extract_claims, queue_priority
 from .risk.complaint import consistency
 from .risk.engine import decide
 from .risk.evidence import build_evidence, fingerprint_hash, sanitize_simulated
+from .risk.graph import neighbourhood
 from .risk.learning import gap_report, rescore_payers, scam_library
 from .risk.reference_ai import read_reference
 from .risk.snapshot import SnapshotError
@@ -55,6 +56,7 @@ MIN_AMOUNT, MAX_AMOUNT = Decimal("0.50"), Decimal("1000.00")
 PAYPAL_DOWN = (PayPalError, httpx.HTTPError)  # a refusal from PayPal, or PayPal unreachable
 ATTEMPTS_PER_HOUR = 60
 COMPLAINTS_PER_DAY = 5
+OPEN_COMPLAINTS = ("fast_tracked", "in_review", "manual_review", "awaiting_second_approval")
 STALE_CAPTURE_SECONDS = 60
 
 
@@ -210,7 +212,8 @@ def add_event(
     session.add(PaymentEvent(payment_id=payment_id, actor=actor, action=action, details=details or {}))
     # One JSON line per event for log search and alerting. Details hold ids, scores and statuses only:
     # never tokens, keys or complaint text.
-    log.info(json.dumps({"event": action, "payment_id": payment_id, "actor": actor, **(details or {})}, default=str))
+    # Fixed keys go last so a details key can never replace them.
+    log.info(json.dumps({**(details or {}), "event": action, "payment_id": payment_id, "actor": actor}, default=str))
 
 
 def _decision_summary(decision: dict[str, Any], simulated: list[str]) -> dict[str, Any]:
@@ -849,6 +852,8 @@ def _case(session: Session, p: AppPayment) -> dict[str, Any]:
             "ai_read_claims": {k: v for k, v in complaint.claims.items() if not k.startswith("_")},
             "ai_status": complaint.claims.get("_status"),
             "queue_priority": complaint.claims.get("_priority"),
+            "first_approver": complaint.claims.get("_first_approver"),
+            "needs_second_approval": p.amount >= Decimal(get_settings().refund_second_approval_usd),
             "consistency": complaint.result,
             "filed_at": complaint.created_at.isoformat(),
         }
@@ -862,9 +867,7 @@ def review_queue() -> dict[str, Any]:
     with db.session_scope() as session:
         held = session.scalars(select(AppPayment).where(AppPayment.status == "held").order_by(AppPayment.id)).all()
         open_complaints = session.scalars(
-            select(AppComplaint)
-            .where(AppComplaint.status.in_(("fast_tracked", "in_review", "manual_review")))
-            .order_by(AppComplaint.id)
+            select(AppComplaint).where(AppComplaint.status.in_(OPEN_COMPLAINTS)).order_by(AppComplaint.id)
         ).all()
         recent = session.scalars(select(AppPayment).order_by(AppPayment.id.desc()).limit(25)).all()
 
@@ -955,13 +958,26 @@ def approve_refund(
             raise HTTPException(status_code=404, detail="complaint not found")
         p = session.get(AppPayment, c.payment_id)
         assert p is not None
-        if c.status not in ("fast_tracked", "in_review", "manual_review", "refund_approved"):
+        if c.status not in (*OPEN_COMPLAINTS, "refund_approved"):
             raise HTTPException(status_code=409, detail="this complaint is closed")
         if p.status not in ("captured", "refunded") or not p.paypal_capture_id:
             raise HTTPException(status_code=409, detail="there is no captured payment to refund")
         amount, currency, capture_id, payment_id = f"{p.amount:.2f}", p.currency, p.paypal_capture_id, p.id
         if body.confirm_amount.strip() != amount:
             raise HTTPException(status_code=422, detail="the typed amount doesn't match the payment")
+        # Two people for larger refunds: the first approval only records itself; a DIFFERENT named person
+        # must give the second. The shared owner key counts as one person ("owner").
+        if p.amount >= Decimal(get_settings().refund_second_approval_usd) and c.status != "refund_approved":
+            first = c.claims.get("_first_approver")
+            if c.status != "awaiting_second_approval":
+                c.claims = {**c.claims, "_first_approver": by}
+                c.status = "awaiting_second_approval"
+                add_event(
+                    session, payment_id, "reviewer", "refund_first_approval", {"complaint_id": complaint_id, "by": by}
+                )
+                return {"status": "awaiting_second_approval", "first_approver": by, "needs": "a different reviewer"}
+            if first == by:
+                raise HTTPException(status_code=409, detail="the second approval must come from a different reviewer")
         c.status = "refund_approved"  # confirmed fraud from here on, even if the PayPal call needs a retry
         add_event(session, payment_id, "reviewer", "refund_approved", {"complaint_id": complaint_id, "by": by})
     try:
@@ -990,7 +1006,7 @@ def decline_refund(complaint_id: int, by: str = Depends(require_reviewer)) -> di
         c = session.get(AppComplaint, complaint_id)
         if c is None:
             raise HTTPException(status_code=404, detail="complaint not found")
-        if c.status not in ("fast_tracked", "in_review", "manual_review"):
+        if c.status not in OPEN_COMPLAINTS:
             raise HTTPException(status_code=409, detail="this complaint is closed")
         c.status, c.decided_at = "refund_declined", clock()
         add_event(session, c.payment_id, "reviewer", "refund_declined", {"complaint_id": complaint_id, "by": by})
@@ -1049,6 +1065,67 @@ def risk_gap(payment_id: int, typology: str = Query(max_length=40)) -> dict[str,
         return gap_report(service.open_decision(row), typology)
 
 
+@router.get("/risk/graph/{handle}", dependencies=[Depends(require_reviewer)])
+def risk_graph(handle: str) -> dict[str, Any]:
+    """One account's place in the payments graph: who it paid and was paid by, the devices and networks it
+    shares with other accounts, and findings (fan-in, fan-out, device ring, link to confirmed fraud)."""
+    with db.session_scope() as session:
+        out = neighbourhood(session, handle.strip().lower(), clock())
+    if out is None:
+        raise HTTPException(status_code=404, detail="no such account")
+    return out
+
+
+@router.get("/risk/labels", dependencies=[Depends(require_owner)])
+def risk_labels() -> dict[str, Any]:
+    """Reviewer outcomes as labels, with what the engine decided at the time. A refund approved = fraud; a
+    refund declined = legitimate. These are the only REAL measurements this system has: the rates below are
+    computed on decisions the rules were not tuned against. The rows are also the training set a model would
+    need (features = signals fired at decision time, label = the reviewer's outcome).
+
+    Caveat: only payments that were completed AND complained about get a label, so this says nothing about
+    fraud nobody reported or payments the engine blocked."""
+    _ring_or_503()
+    rows: list[dict[str, Any]] = []
+    with db.session_scope() as session:
+        decided = session.scalars(
+            select(AppComplaint).where(AppComplaint.status.in_(("refunded", "refund_approved", "refund_declined")))
+        ).all()
+        for c in decided:
+            record = service.decision_for(session, c.payment_id)
+            if record is None:
+                continue
+            try:
+                d = service.open_decision(record)["decision"]
+            except SnapshotError:
+                continue
+            rows.append(
+                {
+                    "payment_id": c.payment_id,
+                    "label": "legitimate" if c.status == "refund_declined" else "fraud",
+                    "claim": c.claim,
+                    "score": d["score"],
+                    "action": d["action"],
+                    "ruleset_version": d["ruleset_version"],
+                    "signals_fired": [f["name"] for f in d["signals_fired"]],
+                    "missing_data_count": len(d["missing_data"]),
+                }
+            )
+    fraud = [r for r in rows if r["label"] == "fraud"]
+    legit = [r for r in rows if r["label"] == "legitimate"]
+    slowed = lambda rs: sum(1 for r in rs if r["action"] != "allow")  # noqa: E731
+    return {
+        "labelled": len(rows),
+        "fraud": len(fraud),
+        "legitimate": len(legit),
+        "fraud_the_engine_had_slowed": slowed(fraud),
+        "fraud_the_engine_allowed": len(fraud) - slowed(fraud),
+        "legitimate_the_engine_had_slowed": slowed(legit),
+        "note": ("Too few labels to state a rate." if len(rows) < 30 else "Rates on reviewer-labelled payments only."),
+        "rows": rows,
+    }
+
+
 @router.get("/risk/scam-library", dependencies=[Depends(require_owner)])
 def risk_scam_library() -> dict[str, Any]:
     """Confirmed cases grouped by type. A case is confirmed when a reviewer approved the refund; a payment
@@ -1074,8 +1151,9 @@ def risk_scam_library() -> dict[str, Any]:
 
 @router.get("/review/audit", dependencies=[Depends(require_owner)])
 def review_audit(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
-    """Every reviewer action, newest first, with who did it. Rows are append-only in the application: no
-    endpoint edits or deletes them."""
+    """Every reviewer action, newest first, with who did it. No endpoint edits or deletes these rows, but they
+    are ordinary database rows, NOT sealed: someone with database write access could change them. Only the
+    risk decisions are tamper-evident."""
     with db.session_scope() as session:
         rows = session.scalars(
             select(PaymentEvent).where(PaymentEvent.actor == "reviewer").order_by(PaymentEvent.id.desc()).limit(limit)
@@ -1121,9 +1199,7 @@ def metrics() -> dict[str, Any]:
             ).all()
         )
         oldest_open = session.scalar(
-            select(func.min(AppComplaint.created_at)).where(
-                AppComplaint.status.in_(("fast_tracked", "in_review", "manual_review"))
-            )
+            select(func.min(AppComplaint.created_at)).where(AppComplaint.status.in_(OPEN_COMPLAINTS))
         )
         total = sum(by_status.values())
         stopped = by_status.get("held", 0) + by_status.get("blocked", 0) + by_status.get("declined", 0)
@@ -1169,7 +1245,9 @@ def reconcile(request: Request, limit: int = Query(default=10, ge=1, le=25)) -> 
             problems.append(f"PayPal order status is {order.get('status')}")
         if (unit.get("amount") or {}).get("value") != f"{amount:.2f}":
             problems.append("amount differs")
-        if first.get("id") and first.get("id") != capture_id:
+        if not first.get("id"):
+            problems.append("PayPal shows no capture for this order")
+        elif first.get("id") != capture_id:
             problems.append("capture id differs")
         if problems:
             mismatches.append({"payment_id": pid, "problem": "; ".join(problems)})

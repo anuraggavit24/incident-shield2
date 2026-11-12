@@ -22,8 +22,9 @@ There is no alerting: someone has to look. An uptime monitor on `/health/ready` 
 - **Before a demo:** open `/health/ready` (free instances sleep after 15 minutes), then `/metrics`.
 - **Daily, if anyone is using it:** `GET /risk/checkpoint` and save the JSON outside the database (a password
   manager note is enough). Without it, records removed from the end of the chain can't be detected.
-- **Add a reviewer:** `python scripts/make_reviewer_key.py <name>`, add the printed `name:hash` to `REVIEWERS`
-  on Render, redeploy. **Remove one:** delete their entry, redeploy. Their past actions stay in `/review/audit`.
+- **Add a reviewer:** `python scripts/make_reviewer_key.py <name> [days]`, add the printed `name:hash:last-day`
+  to `REVIEWERS` on Render, redeploy. Keys stop working after their last day (default 30 days): reissue before then.
+  Refunds of $100 or more need two different reviewers, so keep at least two valid keys. **Remove one:** delete their entry, redeploy. Their past actions stay in `/review/audit`.
 
 ## Deploy and rollback
 

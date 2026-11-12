@@ -63,11 +63,12 @@ async function openCase(id) {
     for (const ch of k.consistency.checks) { const tr = el("tr"); tr.append(el("td", (ch.points > 0 ? "+" : "") + ch.points), el("td", ch.check), el("td", ch.meaning, "mute")); t.append(tr); }
     body.append(t);
     if (k.time_to_return_seconds !== undefined) body.append(kv("Complaint to refund", k.time_to_return_seconds + " seconds", "pill refunded"));
-    if (["fast_tracked", "in_review", "manual_review"].includes(k.status)) {
+    if (k.needs_second_approval) body.append(kv("Two-person rule", k.first_approver ? "first approval by " + k.first_approver + "; a different reviewer must give the second" : "this refund needs two different reviewers", "tag"));
+    if (["fast_tracked", "in_review", "manual_review", "awaiting_second_approval"].includes(k.status)) {
       const amt = el("input"); amt.placeholder = "Type " + c.amount + " to confirm"; amt.style.maxWidth = "200px";
       const msg = el("span", "", "mute"); body.append(el("p"));
       const act = el("p"); act.append(amt, " ",
-        button("Approve refund (PayPal sandbox)", async () => { try { const r = await api("/review/complaints/" + k.id + "/approve", "POST", { confirm_amount: amt.value }); msg.textContent = "Refunded in " + r.seconds_from_complaint_to_refund + "s"; await openCase(id); await loadQueue(); } catch (e) { msg.textContent = e.message; msg.className = "err"; } }), " ",
+        button("Approve refund (PayPal sandbox)", async () => { try { const r = await api("/review/complaints/" + k.id + "/approve", "POST", { confirm_amount: amt.value }); msg.textContent = r.status === "refunded" ? "Refunded in " + r.seconds_from_complaint_to_refund + "s" : "First approval recorded. A different reviewer must approve next."; await openCase(id); await loadQueue(); } catch (e) { msg.textContent = e.message; msg.className = "err"; } }), " ",
         button("Decline", async () => { try { await api("/review/complaints/" + k.id + "/decline", "POST"); await openCase(id); await loadQueue(); } catch (e) { msg.textContent = e.message; msg.className = "err"; } }, "ghost"), " ", msg);
       body.append(act);
     }
@@ -78,6 +79,10 @@ async function openCase(id) {
       button("Decline", async () => { try { await api("/review/payments/" + id + "/decline", "POST"); await openCase(id); await loadQueue(); } catch (e) { msg.textContent = e.message; } }, "ghost"), " ", msg);
     body.append(act);
   }
+  const graphBox = el("pre", "", "mono wrap");
+  const graphRow = el("p");
+  for (const who of [c.payer, c.payee]) graphRow.append(button("Graph: @" + who, async () => { try { const g = await api("/risk/graph/" + encodeURIComponent(who)); graphBox.textContent = (g.findings.length ? g.findings.map((f) => "! " + f.finding.replace(/_/g, " ") + ": " + f.detail + (f.accounts ? " (" + f.accounts.join(", ") + ")" : "")).join("\n") : "No graph findings.") + "\npaid to: " + (g.paid_to.map((x) => "@" + x.account + " x" + x.payments).join(", ") || "nobody") + "\npaid by: " + (g.paid_by.map((x) => "@" + x.account + " x" + x.payments).join(", ") || "nobody") + "\nshared devices: " + (g.shared_devices.map((x) => x.accounts.join("+")).join("; ") || "none") + "\nshared networks: " + (g.shared_networks.map((x) => x.accounts.join("+")).join("; ") || "none") + "\n" + g.evidence_note; } catch (e) { graphBox.textContent = e.message; } }, "ghost"), " ");
+  body.append(el("h2", "Payments graph"), graphRow, graphBox);
   body.append(el("h2", "Timeline"));
   const tl = el("table");
   for (const e of c.timeline) { const tr = el("tr"); tr.append(el("td", e.at.replace("T", " ").slice(0, 19), "mono"), el("td", e.actor), el("td", e.action.replace(/_/g, " "))); tl.append(tr); }
@@ -94,6 +99,6 @@ $("verify").addEventListener("click", async () => {
 });
 $("ckpt").addEventListener("click", async () => { try { $("chain-out").textContent = JSON.stringify(await api("/risk/checkpoint"), null, 2) + "\n\nSave this OUTSIDE the database."; } catch (e) { $("chain-out").textContent = e.message; } });
 $("lib").addEventListener("click", async () => { try { $("chain-out").textContent = JSON.stringify(await api("/risk/scam-library"), null, 2); } catch (e) { $("chain-out").textContent = e.message; } });
-for (const [id, path] of [["audit", "/review/audit"], ["metrics", "/metrics"], ["recon", "/review/reconcile"]]) {
+for (const [id, path] of [["audit", "/review/audit"], ["labels", "/risk/labels"], ["metrics", "/metrics"], ["recon", "/review/reconcile"]]) {
   $(id).addEventListener("click", async () => { try { $("chain-out").textContent = JSON.stringify(await api(path), null, 2); } catch (e) { $("chain-out").textContent = e.message + " (owner key needed)"; } });
 }

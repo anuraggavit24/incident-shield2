@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import hashlib
 import statistics
-from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -24,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import AppComplaint, AppPayment, AppUser
+from .graph import confirmed_fraud_accounts, fraud_distance
 
 COMPLETED = "captured"
 CONFIRMED_FRAUD = ("refund_approved", "refunded")
@@ -62,47 +62,6 @@ def sanitize_simulated(sim: dict[str, Any]) -> dict[str, Any]:
 
 def _days(later: datetime, earlier: datetime) -> int:
     return max(0, (later - earlier).days)
-
-
-def _fraud_accounts(session: Session) -> set[int]:
-    """Accounts that received a payment a reviewer confirmed as fraud (refund approved)."""
-    rows = session.execute(
-        select(AppPayment.payee_id)
-        .join(AppComplaint, AppComplaint.payment_id == AppPayment.id)
-        .where(AppComplaint.status.in_(CONFIRMED_FRAUD))
-    ).all()
-    return {r[0] for r in rows}
-
-
-def _hops_to_fraud(session: Session, payee_id: int, fraud: set[int], now: datetime) -> int:
-    """Shortest link, over completed payments in the last 30 days, from this account to a confirmed one."""
-    if payee_id in fraud:
-        return 0
-    if not fraud:
-        return NOT_LINKED
-    rows = session.execute(
-        select(AppPayment.payer_id, AppPayment.payee_id).where(
-            AppPayment.status == COMPLETED, AppPayment.created_at >= now - timedelta(days=30)
-        )
-    ).all()
-    graph: dict[int, set[int]] = defaultdict(set)
-    for a, b in rows:
-        graph[a].add(b)
-        graph[b].add(a)
-    seen = {payee_id}
-    queue = deque([(payee_id, 0)])
-    while queue:
-        node, dist = queue.popleft()
-        if dist == 2:
-            continue
-        for nxt in graph[node]:
-            if nxt in seen:
-                continue
-            if nxt in fraud:
-                return dist + 1
-            seen.add(nxt)
-            queue.append((nxt, dist + 1))
-    return NOT_LINKED
 
 
 def build_evidence(
@@ -227,7 +186,7 @@ def build_evidence(
     )
     e["accounts_on_device_or_ip_7d"] = len({r[0] for r in sharing} | {payer.id})
     e["accounts_on_device_7d"] = len({r[0] for r in sharing if r[1] == device_id} | {payer.id})
-    fraud = _fraud_accounts(session)
+    fraud = confirmed_fraud_accounts(session)
     e["device_linked_to_fraud"] = any(r[0] in fraud and r[1] == device_id for r in sharing)
     e["ip_shared_with_fraud_accounts"] = any(r[0] in fraud and r[2] == ip_hash for r in sharing)
 
@@ -256,7 +215,9 @@ def build_evidence(
     e["recipient_prior_complaints"] = len(
         set(session.scalars(select(AppComplaint.payer_id).where(AppComplaint.payment_id.in_(payee_payment_ids_all))))
     )
-    e["recipient_hops_to_fraud"] = _hops_to_fraud(session, payee.id, fraud, now)
+    # Graph distance to a confirmed-fraud account, by completed payments or a shared device (risk/graph.py).
+    distance = fraud_distance(session, payee.id, fraud, now)
+    e["recipient_hops_to_fraud"] = NOT_LINKED if distance is None else distance
     e["on_negative_list"] = payee.id in fraud
 
     # ---- what the payer typed and how

@@ -57,20 +57,23 @@ Pages: `/app` (payer checkout), `/review` (reviewer console, owner key), `/docs`
 
 ## Roles, audit and operations
 
-- **Roles:** the owner key can do everything. Named reviewer keys (`REVIEWERS=asha:<sha256>,...`, from `scripts/make_reviewer_key.py`) can work the review queue only. Every release, decline and refund is recorded under the reviewer's name (`GET /review/audit`).
+- **Roles:** the owner key can do everything. Named reviewer keys (`REVIEWERS=asha:<sha256>:<last day>,...`, from `scripts/make_reviewer_key.py`) can work the review queue only, and stop working after their last day. Every release, decline and refund is recorded under the reviewer's name (`GET /review/audit`). That record is ordinary database rows, not sealed.
+- **Two-person refunds:** a refund of $100 or more (`REFUND_SECOND_APPROVAL_USD`) needs two different reviewers. The shared owner key counts as one person, so large refunds need at least one named reviewer.
+- **Payments graph:** `GET /risk/graph/{handle}` shows who an account paid and was paid by, the devices and networks it shares, and findings (fan-in, fan-out, device ring, link to confirmed fraud). A fresh account run from the same device as a confirmed-fraud account is flagged before anyone has paid it. A shared network alone never counts as a link.
+- **Labels:** `GET /risk/labels` pairs each reviewer outcome (refund approved = fraud, declined = legitimate) with what the engine decided at the time. It is the only real measurement here and the training set a model would need. There is no machine-learning model: with no real labels yet, one would only learn the rules back.
 - **Operations:** `GET /metrics` (counts, refund time, oldest open complaint, PayPal failures), `GET /review/reconcile` (the ledger against PayPal), one JSON log line per payment event, and `RUNBOOK.md` for deploy, rollback, key rotation and incidents.
 - **Threat model:** `THREAT_MODEL.md` lists each attacker, the control in the code, and what is left open.
 
 ## Measured on simulated payments (`BENCHMARK.md`)
 
-`python scripts/benchmark.py` scores 1,275 labelled, simulated payments with the same `decide()` the app uses. **The data is simulated and was written by the authors of the rules, so this is not real-world accuracy.**
+`python scripts/benchmark.py` scores labelled, simulated payments with the same `decide()` the app uses. **The data is simulated and was written by the authors of the rules, so this is not real-world accuracy.**
 
-| Measure | Value |
-|---|---|
-| Fraud slowed or stopped | 53.8% of 275 |
-| Legitimate payments slowed | 1.2% of 1000 |
+| Set | Fraud slowed or stopped | Legitimate payments slowed |
+|---|---|---|
+| Tuning set (rules were adjusted with it in view) | 53.8% of 275 | 1.2% of 1,000 |
+| **Held-out set** (written after the last rule change, never tuned against) | **9.4% of 160** | 0.6% of 160 |
 
-The useful part is where it fails. Full-pattern takeover, coached scam, mule recipient, device farm and confirmed-fraud recipient are stopped 92–100% of the time. **Evasive fraud is not caught at all (0%)**: a takeover that waits 72 hours and stays under 3x the usual amount, a coached scam with a bland reference, a mule that keeps 21%, and card testing (the app has no card data). On the legitimate side, 27.5% of people who set up a new phone, reset their password and pay someone new are stopped. The benchmark also found a real gap that was then fixed: payments to an account with a confirmed fraud complaint were allowed 85% of the time until a floor was added (ruleset `2026.11-2`).
+The held-out number is the honest one: on fraud the rules weren't written around (a takeover in ordinary-sized payments, a coached victim on a new phone, a mule using an aged account, a fresh member of a fraud ring), the engine catches almost nothing. In the tuning set it misses evasive fraud completely (0%): a patient takeover, a bland scam reference, a mule that keeps 21%, and card testing. It also stops about one in four honest people who set up a new phone, reset their password and pay someone new. Fixed thresholds chosen by judgement do this; closing the gap needs real labelled outcomes, which `GET /risk/labels` now collects from reviewer decisions.
 
 **Real Gemini:** `python scripts/ai_eval.py` runs the reference reader, complaint reader and case brief against the real model on small labelled sets and prints the scores. Results: _not yet run; paste the three summary lines here._
 
@@ -140,6 +143,8 @@ pytest -q
 - Browser measurements (device id, fingerprint, typing speed) are sent by the client and can be forged. A real deployment needs device attestation. The client IP is read from `CF-Connecting-IP` (Render serves through Cloudflare, which sets it), falling back to the first `X-Forwarded-For` entry, which a client can forge. Neither has been verified on the live deployment.
 - Because that evidence can be staged, a fraudster can arrange a takeover-looking record and then claim "unauthorised" to get a high consistency score. The score only orders the reviewer's queue; a human approves every refund, and the console says the evidence is browser-reported.
 - Queue priority uses the customer's own words, so someone can write an urgent-sounding complaint to be seen sooner. The bonus is fixed and small, it is shown to the reviewer with its reason, and it can't override the evidence cap. It changes when a case is looked at, not what is decided.
+- The payments graph reads every payment from the last 30 days on each attempt. Fine for a demo, too slow at volume; it needs an incremental graph store.
+- Sharing a device with a confirmed-fraud account raises the score of the other accounts on it, which will include innocent family members.
 - Withheld evidence lowers a score (missing data scores 0). That is a deliberate choice against guessing, and it is exploitable.
 - A refund only goes back to the original payer, and only while the captured funds are still in the sandbox merchant account. In real fraud the money has often left; this app can't recover it, and it can't freeze funds inside PayPal.
 - Demo mode (`SIMULATION_ENABLED=true`) shows the score and reasons to the payer. A real service wouldn't show that to an attacker.

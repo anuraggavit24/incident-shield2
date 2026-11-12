@@ -1204,3 +1204,196 @@ def test_a_payee_with_a_confirmed_fraud_complaint_is_held_for_the_next_payer(wor
     r = pay(world, signup(world, "dave"), "carol", 10, name="Carol").json()
     assert r["action"] == "hold_review" and "CONFIRMED_FRAUD_RECIPIENT" in r["decision"]["floors_triggered"]
     assert not [c for c in world.paypal.called("create_order") if c[2] == str(r["payment_id"])]
+
+
+# --------------------------------------------------------------------------- two-person refunds, expiring keys
+
+
+def reviewer_env(monkeypatch, **expiry):
+    import hashlib
+
+    parts = []
+    for name in ("asha", "ravi"):
+        entry = f"{name}:{hashlib.sha256(f'{name}-key'.encode()).hexdigest()}"
+        parts.append(entry + (f":{expiry[name]}" if name in expiry else ""))
+    monkeypatch.setenv("REVIEWERS", ",".join(parts))
+    return {"X-API-Key": "asha-key"}, {"X-API-Key": "ravi-key"}
+
+
+def big_captured_payment(world, amount="150.00"):
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    pid = pay(world, alice, "bob", amount).json()["payment_id"]
+    assert world.post(f"/app/payments/{pid}/capture", headers=alice).status_code == 200
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    return pid, cid
+
+
+def test_a_large_refund_needs_two_different_reviewers(world, monkeypatch) -> None:
+    asha, ravi = reviewer_env(monkeypatch)
+    pid, cid = big_captured_payment(world)
+    body = {"confirm_amount": "150.00"}
+    first = world.post(f"/review/complaints/{cid}/approve", headers=asha, json=body).json()
+    assert first == {"status": "awaiting_second_approval", "first_approver": "asha", "needs": "a different reviewer"}
+    assert not world.paypal.called("refund_capture")  # one approval moves no money
+    again = world.post(f"/review/complaints/{cid}/approve", headers=asha, json=body)
+    assert again.status_code == 409 and "different reviewer" in again.json()["detail"]
+    assert not world.paypal.called("refund_capture")
+    queue = world.get("/review/queue", headers=ravi).json()["open_complaints"]
+    assert queue[0]["status"] == "awaiting_second_approval"  # still in the queue for the second person
+    assert (
+        world.post(f"/review/complaints/{cid}/approve", headers=ravi, json={"confirm_amount": "15.00"}).status_code
+        == 422
+    )
+    done = world.post(f"/review/complaints/{cid}/approve", headers=ravi, json=body)
+    assert done.status_code == 200 and done.json()["status"] == "refunded"
+    assert len(world.paypal.called("refund_capture")) == 1
+    trail = [(a["by"], a["action"]) for a in world.get("/review/audit", headers=OWNER).json()["actions"]]
+    assert trail == [("ravi", "refund_approved"), ("asha", "refund_first_approval")]
+
+
+def test_the_shared_owner_key_cannot_give_both_approvals_and_small_refunds_need_one(world, monkeypatch) -> None:
+    reviewer_env(monkeypatch)
+    pid, cid = big_captured_payment(world, "100.00")  # exactly at the limit counts
+    body = {"confirm_amount": "100.00"}
+    assert (
+        world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json=body).json()["status"]
+        == "awaiting_second_approval"
+    )
+    assert world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json=body).status_code == 409
+    assert not world.paypal.called("refund_capture")
+    # a first approval can still be overturned by a decline
+    assert world.post(f"/review/complaints/{cid}/decline", headers=OWNER).json()["status"] == "refund_declined"
+    assert world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json=body).status_code == 409
+
+
+def test_a_refund_under_the_limit_needs_one_approval(world) -> None:
+    alice, pid = captured_scam_payment(world)  # $45
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    assert (
+        world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json={"confirm_amount": "45.00"}).json()[
+            "status"
+        ]
+        == "refunded"
+    )
+
+
+def test_reviewer_keys_expire_and_an_unreadable_date_means_refused(world, monkeypatch) -> None:
+    from datetime import date
+
+    from app import auth
+
+    monkeypatch.setattr(auth, "today", lambda: date(2026, 11, 12))
+    asha, ravi = reviewer_env(monkeypatch, asha="2026-11-12", ravi="2026-11-11")
+    assert world.get("/review/queue", headers=asha).status_code == 200  # last valid day
+    assert world.get("/review/queue", headers=ravi).status_code == 401  # expired yesterday
+    asha, ravi = reviewer_env(monkeypatch, asha="next week", ravi="2027-01-01")
+    assert world.get("/review/queue", headers=asha).status_code == 401
+    assert world.get("/review/queue", headers=ravi).status_code == 200
+
+
+# --------------------------------------------------------------------------- payments graph and labels
+
+
+def live_payment(payer, payee, amount, at, device=DEV_A, ip="ip-x", status="captured"):
+    pid = add_payment(payer, payee, amount, at, status=status, device=device, ip=ip)
+    with db.session_scope() as s:
+        s.get(AppPayment, pid).seeded = False
+    return pid
+
+
+def test_a_fresh_account_run_from_a_confirmed_fraudsters_device_is_flagged_before_anyone_pays_it(world) -> None:
+    # carol is confirmed fraud (refund approved against her)
+    alice, pid = captured_scam_payment(world)
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json={"confirm_amount": "45.00"})
+    # carol's device also runs a brand-new account, "carol2", which nobody has paid or complained about
+    ring_device = "f" * 32
+    make_user("carol2", T0 - timedelta(days=1), "Carol Two")
+    make_user("shop", T0 - timedelta(days=300), "Shop")
+    live_payment("carol", "shop", 5, T0 - timedelta(hours=3), device=ring_device, ip="ip-cafe", status="cancelled")
+    live_payment("carol2", "shop", 5, T0 - timedelta(hours=2), device=ring_device, ip="ip-home2", status="cancelled")
+    # a stranger who only shares the cafe's network with carol must NOT be treated as linked to fraud
+    make_user("stranger", T0 - timedelta(days=200), "Stranger")
+    live_payment("stranger", "shop", 5, T0 - timedelta(hours=1), device="9" * 32, ip="ip-cafe", status="cancelled")
+    dave = signup(world, "dave")
+    unlinked = pay(world, dave, "stranger", 10, name="Stranger").json()
+    assert "RC3_LINKED_TO_FRAUD" not in unlinked["decision"]["signals_fired"]
+    r = pay(world, dave, "carol2", 10, name="Carol Two").json()
+    assert "RC3_LINKED_TO_FRAUD" in r["decision"]["signals_fired"]
+    clean = pay(world, dave, "shop", 10, name="Shop").json()  # shop only received attempts: not linked
+    assert "RC3_LINKED_TO_FRAUD" not in clean["decision"]["signals_fired"]
+    g = world.get("/risk/graph/carol2", headers=OWNER).json()
+    assert {"finding": "linked_to_confirmed_fraud", "detail": "1 step(s) away by payment or shared device"} in g[
+        "findings"
+    ]
+    assert g["shared_devices"] == [{"device": "ffffffff", "accounts": ["carol", "carol2"]}]
+
+
+def test_graph_reports_fan_in_fan_out_rings_and_does_not_treat_a_shared_network_as_a_fraud_link(world) -> None:
+    make_user("mule", T0 - timedelta(days=5))
+    make_user("exit1", T0 - timedelta(days=200))
+    for i in range(5):
+        make_user(f"v{i}", T0 - timedelta(days=90))
+        live_payment(f"v{i}", "mule", 100, T0 - timedelta(minutes=50 - i), device=f"{i}" * 32, ip="ip-shared")
+    for i in range(4):
+        if i:
+            make_user(f"exit{i + 1}", T0 - timedelta(days=200))
+        live_payment("mule", f"exit{i + 1}", 110, T0 - timedelta(minutes=20 - i), device="e" * 32, ip="ip-mule")
+    for name in ("ring_a", "ring_b"):
+        make_user(name, T0 - timedelta(days=2))
+        live_payment(name, "exit1", 1, T0 - timedelta(minutes=5), device="e" * 32, ip="ip-other", status="blocked")
+    g = world.get("/risk/graph/mule", headers=OWNER).json()
+    found = {f["finding"]: f for f in g["findings"]}
+    assert found["fan_in"]["detail"] == "5 different payers in 7 days"
+    assert found["fan_out"]["detail"] == "paid 4 accounts within an hour of receiving money"
+    assert (
+        found["device_ring"]["accounts"] == ["mule", "ring_a", "ring_b"]
+        and found["device_ring"]["includes_confirmed_fraud"] is False
+    )
+    assert [x["account"] for x in g["paid_by"]] == ["v0", "v1", "v2", "v3", "v4"]
+    v0 = world.get("/risk/graph/v0", headers=OWNER).json()  # the victims share only a network
+    assert len(v0["shared_networks"][0]["accounts"]) == 5 and v0["shared_devices"] == []
+    assert not any(f["finding"] in ("device_ring", "linked_to_confirmed_fraud") for f in v0["findings"])
+    assert world.get("/risk/graph/nobody", headers=OWNER).status_code == 404
+    assert world.get("/risk/graph/mule").status_code == 401
+
+
+def test_labels_report_what_the_engine_decided_on_reviewer_confirmed_outcomes(world) -> None:
+    alice, pid = captured_scam_payment(world)  # the engine held this one
+    cid = world.post(f"/app/payments/{pid}/complaint", headers=alice, json={"claim": "scam"}).json()["complaint_id"]
+    world.post(f"/review/complaints/{cid}/approve", headers=OWNER, json={"confirm_amount": "45.00"})
+    ok = pay(world, alice, "bob", 20, name="Bob").json()["payment_id"]  # the engine allowed this one
+    world.post(f"/app/payments/{ok}/capture", headers=alice)
+    cid2 = world.post(f"/app/payments/{ok}/complaint", headers=alice, json={"claim": "unauthorised"}).json()[
+        "complaint_id"
+    ]
+    world.post(f"/review/complaints/{cid2}/decline", headers=OWNER)
+    out = world.get("/risk/labels", headers=OWNER).json()
+    assert (out["labelled"], out["fraud"], out["legitimate"]) == (2, 1, 1)
+    assert out["fraud_the_engine_had_slowed"] == 1 and out["fraud_the_engine_allowed"] == 0
+    assert out["legitimate_the_engine_had_slowed"] == 0 and "Too few" in out["note"]
+    by_id = {r["payment_id"]: r for r in out["rows"]}
+    assert by_id[pid]["label"] == "fraud" and "C3_SCAM_REFERENCE" in by_id[pid]["signals_fired"]
+    assert by_id[ok]["label"] == "legitimate" and by_id[ok]["action"] == "allow"
+    assert world.get("/risk/labels", headers={"X-API-Key": "x"}).status_code == 401
+
+
+def test_reconcile_flags_a_completed_order_with_no_capture_and_log_keys_cannot_be_overwritten(world, caplog) -> None:
+    import json
+    import logging
+
+    alice, _ = signup(world, "alice"), signup(world, "bob")
+    pid = pay(world, alice, "bob", "10.00").json()["payment_id"]
+    world.post(f"/app/payments/{pid}/capture", headers=alice)
+    world.paypal.get_order = lambda oid: {
+        "status": "COMPLETED",
+        "purchase_units": [{"amount": {"value": "10.00"}, "payments": {"captures": []}}],
+    }
+    out = world.get("/review/reconcile", headers=OWNER).json()
+    assert out["ok"] is False and out["mismatches"] == [
+        {"payment_id": pid, "problem": "PayPal shows no capture for this order"}
+    ]
+    with caplog.at_level(logging.INFO, logger="incident_shield.payapp"), db.session_scope() as s:
+        payapp.add_event(s, pid, "system", "real_event", {"event": "forged", "actor": "forged", "payment_id": -1})
+    line = json.loads(caplog.records[-1].message)
+    assert (line["event"], line["actor"], line["payment_id"]) == ("real_event", "system", pid)

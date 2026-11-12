@@ -1,8 +1,9 @@
 """Who may do what.
 
 - The OWNER key (OWNER_API_KEY_SHA256) can do everything: review, risk records, metrics, audit, reconcile.
-- REVIEWER keys (REVIEWERS="asha:<sha256>,ravi:<sha256>") can work the review queue only. Each reviewer has
-  their own key, so every release, decline and refund is recorded under a name.
+- REVIEWER keys (REVIEWERS="asha:<sha256>:2026-12-31,ravi:<sha256>") can work the review queue only. Each
+  reviewer has their own key, so every release, decline and refund is recorded under a name. The optional
+  third part is the last day the key works (UTC); after it the key is refused.
 Only hashes are configured; the keys themselves are never stored.
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 import hmac
 import os
 import re
+from datetime import date, datetime, timezone
 
 from fastapi import HTTPException, Security
 from fastapi.security import APIKeyHeader
@@ -22,14 +24,28 @@ _NAME = re.compile(r"^[a-z0-9_]{2,24}$")
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 
 
+def today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
 def reviewers() -> dict[str, str]:
-    """{name: sha256 hex} from the REVIEWERS variable. Malformed entries are ignored, never half-trusted."""
+    """{name: sha256 hex} for keys that work today. Malformed or expired entries are ignored, never
+    half-trusted: an unreadable expiry date means the key is refused, not that it never expires."""
     out: dict[str, str] = {}
     for part in os.getenv("REVIEWERS", "").split(","):
-        name, _, digest = part.strip().partition(":")
-        name, digest = name.strip().lower(), digest.strip().lower()
-        if _NAME.fullmatch(name) and _HASH.fullmatch(digest) and name != "owner":
-            out[name] = digest
+        fields = [f.strip().lower() for f in part.strip().split(":")]
+        if len(fields) not in (2, 3):
+            continue
+        name, digest = fields[0], fields[1]
+        if not (_NAME.fullmatch(name) and _HASH.fullmatch(digest)) or name == "owner":
+            continue
+        if len(fields) == 3:
+            try:
+                if date.fromisoformat(fields[2]) < today():
+                    continue
+            except ValueError:
+                continue
+        out[name] = digest
     return out
 
 

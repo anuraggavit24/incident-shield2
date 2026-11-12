@@ -344,8 +344,9 @@ def test_benchmark_is_reproducible_and_the_published_file_matches_the_code() -> 
     bench = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bench)
     first, second = bench.run(), bench.run()
-    assert first["rows"] == second["rows"]
-    assert Path("BENCHMARK.md").read_text(encoding="utf-8") == bench.report(first) + "\n"
+    assert first["rows"] == second["rows"] and bench.run_held_out()["rows"] == bench.run_held_out()["rows"]
+    assert Path("BENCHMARK.md").read_text(encoding="utf-8") == bench.report(first, bench.run_held_out()) + "\n"
+    assert "precision" not in bench.report(first).split("## Tuning set")[1].lower()
     rows = {name: (slowed, n) for _, name, n, slowed, _ in first["rows"]}
     assert rows["fraud_known_bad_recipient"][0] == rows["fraud_known_bad_recipient"][1]  # the gap that was fixed
     assert rows["legit_repeat"][0] == 0
